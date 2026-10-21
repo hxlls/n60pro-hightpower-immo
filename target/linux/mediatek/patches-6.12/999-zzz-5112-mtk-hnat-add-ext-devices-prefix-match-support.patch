@@ -1,6 +1,6 @@
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.c
-@@ -1772,6 +1772,18 @@ static int hnat_probe(struct platform_de
+@@ -1774,6 +1774,18 @@ static int hnat_probe(struct platform_de
  		dev_info(&pdev->dev, "ext devices = %s\n", ext_entry->name);
  	}
  
@@ -21,7 +21,7 @@
  
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
-@@ -252,6 +252,7 @@
+@@ -235,6 +235,7 @@
  #define DEF_UDP_KA		1
  #define MAX_EXT_DEVS		(0x3fU)
  #define MAX_IF_NUM		64

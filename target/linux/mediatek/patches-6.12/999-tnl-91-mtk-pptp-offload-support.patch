@@ -35,10 +35,10 @@
  static int pptp_xmit(struct ppp_channel *chan, struct sk_buff *skb)
  {
  	struct sock *sk = chan->private;
-@@ -622,6 +643,9 @@ static int pptp_ppp_ioctl(struct ppp_cha
- static const struct ppp_channel_ops pptp_chan_ops = {
+@@ -686,6 +707,9 @@ static const struct ppp_channel_ops pptp
  	.start_xmit = pptp_xmit,
  	.ioctl      = pptp_ppp_ioctl,
+ 	.fill_forward_path = pptp_fill_forward_path,
 +#if IS_ENABLED(CONFIG_NF_FLOW_TABLE)
 +	.flow_offload_check = pptp_flow_offload_check,
 +#endif /* IS_ENABLED(CONFIG_NF_FLOW_TABLE) */

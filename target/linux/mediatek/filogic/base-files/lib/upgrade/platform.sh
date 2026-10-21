@@ -185,6 +185,8 @@ platform_do_upgrade() {
 	acer,vero-w6m|\
 	airpi,ap3000m|\
 	arcadyan,mozart|\
+	clx,s20l|\
+	clx,s20m|\
 	clx,s20p|\
 	glinet,gl-mt2500|\
 	glinet,gl-mt2500-airoha|\
@@ -251,9 +253,9 @@ platform_do_upgrade() {
 	huasifei,wh3000-pro-nand|\
 	huasifei,wh3000r-nand|\
 	jiorouter,ax6000-jidu6101|\
+	jiorouter,ax6000-jidu6j01|\
 	ruijie,rg-x30e-pro|\
-	zhao,7981r128|\
-	jiorouter,ax6000-jidu6j01)
+	zhao,7981r128)
 		CI_UBIPART="ubi"
 		nand_do_upgrade "$1"
 		;;
@@ -465,6 +467,8 @@ platform_copy_config() {
 	acer,vero-w6m|\
 	airpi,ap3000m|\
 	arcadyan,mozart|\
+	clx,s20l|\
+	clx,s20m|\
 	clx,s20p|\
 	glinet,gl-mt2500|\
 	glinet,gl-mt2500-airoha|\

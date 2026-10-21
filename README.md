@@ -6,7 +6,7 @@ This repository is worked on ImmortalWrt with MTK OpenWrt Feeds patches imported
 
 ## Commit Cutoff Revisions
 
-### ImmortalWrt: [37013c8](https://github.com/immortalwrt/immortalwrt/commit/37013c8153ac6c9e11f4f9210d22832beb3bcb64)
+### ImmortalWrt: [ce35a9e](https://github.com/immortalwrt/immortalwrt/commit/ce35a9e4ef1b87fbbc2146036ce6693e4242861a)
 
 ```
 Merge Official Source
@@ -14,38 +14,32 @@ Merge Official Source
 Signed-off-by: Tianling Shen <cnsztl@immortalwrt.org>
 ```
 
-### MTK OpenWrt Feeds: [a15454c](https://github.com/mediatek/mtk-openwrt-feeds/commit/a15454c888f4f4144c50e33b5feef4f247c5f78b)
+### MTK OpenWrt Feeds: [08196fa](https://github.com/mediatek/mtk-openwrt-feeds/commit/08196fa6e5d338ce88aa0002f781e2d24289b1f1)
 
 ```
-[kernel-6.12][common][hnat][Fix debugfs-configured PPE settings being lost after a NETSYS SER]
+[HIGH][openwrt-25][MAC80211][WiFi7][Fix build failure due to license header]
 
 [Description]
-Fix debugfs-configured PPE settings being lost after a NETSYS SER.
+Fix image build failure for MP4.3 release SDK.
 
 [Root Cause]
-A SER resets the PPE registers to hardware defaults, then
-hnat_warm_init() re-programs them via hnat_hw_init(), which used
-hardcoded constants and did not cover every register that debugfs can
-configure. Only the settings hnat_hw_init() already read back from
-hnat_priv survived, the rest reverted silently, and in some cases the
-software state in hnat_priv no longer matched the hardware.
+Relevant release patch already includes license header, while internal
+commit does not. Hence, duplicate license header is automatically
+added when transforming commit to patch, causing patching conflict.
 
 [Solution]
-Latch the affected settings in hnat_priv (defaults set in
-hnat_probe()) and program them from hnat_hw_init(), which is shared by
-the cold and warm init paths. Add helpers for the registers
-hnat_hw_init() did not cover, called from both hnat_hw_init() and the
-debugfs handlers so each setting has a single write path.
+Avoid adding duplicate license header.
+
+[Release-log]
+N/A
 
 [How to Verify]
-Configure the settings through debugfs, dump the PPE registers,
-trigger a SER, then confirm the registers still hold.
+N/A
 
 [Info to Customer]
 N/A
 
-
-Change-Id: I4cc44b41b1c1fdf229c0c393623ef820f06c9b9b
+Change-Id: Ieb659d0c7763cf11ce2e63cc6bdc53cc2f674000
 ```
 
 ### l1parser: [081bb31](https://github.com/chasey-dev/l1parser/commit/081bb31211efc74594d25bfd1bb5811f3408a205)
