@@ -14,19 +14,21 @@ The "unclassified" test no longer uses MTK_QDMA_QUEUE_MASK: after the
 64-queue rework that mask became GENMASK(15, 0), so `!(skb->mark &
 MTK_QDMA_QUEUE_MASK)` was almost never true (any fwmark/conntrack mark
 in the low 16 bits skipped the whole block) and the feature silently
-did nothing.  Use HNAT_QDMA_QUEUE_MASK and compare against
-MAX_PPPQ_QUEUE_NUM, which is exactly the threshold the PPPQ/HQoS code
-above uses to tell an explicit queue hint from a per-port queue, and
-stay out of the way when HQoS is active.
+did nothing. HNAT_QDMA_QUEUE_MASK is used instead, restricted to the
+bits below HNAT_EXCEPTION_BIT (bit 0..6 on netsys v2/v3, bit 0..3 on
+v1.x), matching how the HQoS path reads the id back, and compared
+against MAX_PPPQ_QUEUE_NUM, the threshold the PPPQ/HQoS code above
+uses to tell an explicit queue hint from a per-port queue. Stay out of
+the way when HQoS is active so user rules keep their precedence.
 
 Signed-off-by: hxlls <hxlls@users.noreply.github.com>
 ---
 
 diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-index e890ad9..097a1f5 100644
+index a1675f4..b069e14 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-@@ -3074,7 +3074,59 @@ hnat_entry_bind:
+@@ -3074,7 +3074,64 @@ hnat_entry_bind:
  	else
  		qid = 0;
  
@@ -41,8 +43,13 @@ index e890ad9..097a1f5 100644
 +	 * applies to otherwise unclassified traffic, i.e. to flows whose
 +	 * mark is below MAX_PPPQ_QUEUE_NUM, exactly how the PPPQ/HQoS code
 +	 * above classifies them.
-+	 * HNAT_QDMA_QUEUE_MASK is used on purpose: MTK_QDMA_QUEUE_MASK is
-+	 * redefined per kernel series and no longer covers the queue bits.
++	 *
++	 * HNAT_QDMA_QUEUE_MASK covers only the queue bits, i.e. everything
++	 * below HNAT_EXCEPTION_BIT (netsys v2/v3 use bit 0..6, v1.x bit 0..3),
++	 * which is how the HQoS path reads the id back. Using MTK_QDMA_QUEUE_MASK
++	 * here instead is not an option: it is redefined per kernel series and
++	 * became GENMASK(15, 0) in this tree, covering bits that carry no queue
++	 * number at all, which makes this whole block silently never match.
 +	 */
 +	if (short_pkt_toggle && !IS_HQOS_MODE &&
 +	    (skb->mark & HNAT_QDMA_QUEUE_MASK) < MAX_PPPQ_QUEUE_NUM) {
