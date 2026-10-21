@@ -10,14 +10,23 @@ Flows that already carry an explicit queue id via skb->mark (custom
 priority rules / device rules) keep their queue; auto detection only
 applies to otherwise unclassified traffic.
 
+The "unclassified" test no longer uses MTK_QDMA_QUEUE_MASK: after the
+64-queue rework that mask became GENMASK(15, 0), so `!(skb->mark &
+MTK_QDMA_QUEUE_MASK)` was almost never true (any fwmark/conntrack mark
+in the low 16 bits skipped the whole block) and the feature silently
+did nothing.  Use HNAT_QDMA_QUEUE_MASK and compare against
+MAX_PPPQ_QUEUE_NUM, which is exactly the threshold the PPPQ/HQoS code
+above uses to tell an explicit queue hint from a per-port queue, and
+stay out of the way when HQoS is active.
+
 Signed-off-by: hxlls <hxlls@users.noreply.github.com>
 ---
 
 diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-index ffa6125fc9..23b8575ac3 100644
+index e890ad9..097a1f5 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-@@ -2848,7 +2848,54 @@ hnat_entry_bind:
+@@ -3074,7 +3074,59 @@ hnat_entry_bind:
  	else
  		qid = 0;
  
@@ -29,9 +38,14 @@ index ffa6125fc9..23b8575ac3 100644
 +	 */
 +	/* Flows that already carry an explicit queue id via skb->mark (custom
 +	 * priority rules / device rules) keep that queue; auto detection only
-+	 * applies to otherwise unclassified traffic.
++	 * applies to otherwise unclassified traffic, i.e. to flows whose
++	 * mark is below MAX_PPPQ_QUEUE_NUM, exactly how the PPPQ/HQoS code
++	 * above classifies them.
++	 * HNAT_QDMA_QUEUE_MASK is used on purpose: MTK_QDMA_QUEUE_MASK is
++	 * redefined per kernel series and no longer covers the queue bits.
 +	 */
-+	if (short_pkt_toggle && !(skb->mark & MTK_QDMA_QUEUE_MASK)) {
++	if (short_pkt_toggle && !IS_HQOS_MODE &&
++	    (skb->mark & HNAT_QDMA_QUEUE_MASK) < MAX_PPPQ_QUEUE_NUM) {
 +		if (h_proto == ETH_P_IP) {
 +			iph = (struct iphdr *)(skb_network_header(skb) + h_offset);
 +			if (iph->protocol == IPPROTO_TCP) {

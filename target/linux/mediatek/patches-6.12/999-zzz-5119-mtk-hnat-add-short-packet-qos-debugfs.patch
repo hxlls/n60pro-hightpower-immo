@@ -8,17 +8,40 @@ Also fix hnat_qos_toggle_read to print the value via seq_printf
 instead of pr_info so `cat qos_toggle` works, and include the entry
 qid in the all_entry dump for easier debugging.
 
+Export the queue-index mask as HNAT_QDMA_QUEUE_MASK instead of relying
+on MTK_QDMA_QUEUE_MASK: the latter is redefined per kernel series (the
+64-queue patch turns it into GENMASK(15, 0), other series expand it to
+a per-SoC expression that needs `eth` in scope), and neither variant
+still describes the queue bits, so classifying flows with it silently
+stops matching.
+
+Whenever one of the three knobs is changed to a different value, drop
+the already bound entries via foe_clear_all_bind_entries(): a bound
+flow keeps the queue id stored in its PPE entry and is then forwarded
+by the hardware, so the kernel never runs the classification path for
+it again and the new value looks like it had no effect.
+
 Signed-off-by: hxlls <hxlls@users.noreply.github.com>
 ---
 
 diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
-index 2be5d44304..57b5d46264 100644
+index 8d7f83c..a8152f7 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
-@@ -1509,6 +1509,9 @@ extern int qos_toggle;
+@@ -1535,6 +1535,19 @@ extern int qos_toggle;
  extern int l2br_toggle;
  extern int l4s_toggle;
  extern int tnl_toggle;
++/* The QDMA queue index carried in skb->mark, mirroring how mtk_eth_soc
++ * hands the queue hint to the HNAT hardware.  It must NOT be expressed
++ * via MTK_QDMA_QUEUE_MASK: that macro is redefined between kernel
++ * series (here it becomes GENMASK(15, 0) after the 64-queue change, and
++ * elsewhere expands to a per-SoC expression that needs 'eth' in scope).
++ * Either variant silently defeats the classification below, and once
++ * HNAT takes over the flow the kernel never sees these packets again.
++ */
++#define HNAT_QDMA_QUEUE_MASK		0x3f
++
 +extern int short_pkt_toggle;
 +extern int short_pkt_qid;
 +extern int short_pkt_len;
@@ -26,7 +49,7 @@ index 2be5d44304..57b5d46264 100644
  extern int (*mtk_tnl_decap_offload)(struct sk_buff *skb);
  extern bool (*mtk_tnl_decap_offloadable)(struct sk_buff *skb);
 diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
-index 322ce50dcb..1f41055517 100644
+index b81fddf..97ffd1f 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
 @@ -44,6 +44,9 @@ int tnl_toggle;
@@ -39,7 +62,7 @@ index 322ce50dcb..1f41055517 100644
  struct hnat_desc headroom[DEF_ETRY_NUM];
  unsigned int dbg_cpu_reason_cnt[MAX_CRSN_NUM];
  
-@@ -1927,14 +1930,15 @@ static void dbg_dump_entry(struct seq_file *m, struct foe_entry *entry,
+@@ -1938,14 +1941,15 @@ static void dbg_dump_entry(struct seq_file *m, struct foe_entry *entry,
  
  	if (IS_IPV4_HNAPT(entry)) {
  		seq_printf(m,
@@ -59,7 +82,7 @@ index 322ce50dcb..1f41055517 100644
  	}
  
  	if (IS_IPV4_DSLITE(entry)) {
-@@ -2557,6 +2561,45 @@ static const struct file_operations hnat_ppd_if_fops = {
+@@ -2800,6 +2804,54 @@ static const struct file_operations hnat_ppd_if_fops = {
  	.release = single_release,
  };
  
@@ -85,7 +108,16 @@ index 322ce50dcb..1f41055517 100644
 +	if (kstrtol(buf, 0, &val))						\
 +		return -EINVAL;							\
 +										\
-+	var = val;								\
++	if (var != (int)val) {						\
++		var = val;							\
++		/* Already bound flows keep the queue id stored in their PPE\
++		 * entry: once an entry is written the hardware forwards those\
++		 * packets itself and the kernel never runs this classification\
++		 * again, so drop the bindings to make the new value apply.\
++		 */\
++		foe_clear_all_bind_entries();						\
++	}								\
++									\
 +	pr_info("hnat " #name " = %ld\n", val);					\
 +	return count;								\
 +}										\
@@ -105,7 +137,7 @@ index 322ce50dcb..1f41055517 100644
  static int hnat_mape_toggle_read(struct seq_file *m, void *private)
  {
  	pr_info("value=%d, %s is enabled now!\n", mape_toggle, (mape_toggle) ? "mape" : "ds-lite");
-@@ -3271,18 +3314,7 @@ static void hnat_qos_toggle_usage(void)
+@@ -3514,18 +3566,7 @@ static void hnat_qos_toggle_usage(void)
  
  static int hnat_qos_toggle_read(struct seq_file *m, void *private)
  {
@@ -125,7 +157,7 @@ index 322ce50dcb..1f41055517 100644
  	return 0;
  }
  
-@@ -4145,6 +4177,13 @@ int hnat_init_debugfs(struct mtk_hnat *h)
+@@ -4383,6 +4424,13 @@ int hnat_init_debugfs(struct mtk_hnat *h)
  		debugfs_create_symlink(name, root, name_symlink);
  	}
  
