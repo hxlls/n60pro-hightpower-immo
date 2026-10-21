@@ -69,13 +69,19 @@ enum mtk_hnat_version {
 |---|---|---|---|
 | 1 | `999-eth-26` | 新增 `#define MTK_QDMA_QUEUE_MASK (MTK_QDMA_NUM_QUEUES - 1)` | `0xF`（NUM_QUEUES=16） |
 | 2 | `999-eth-56` | `MTK_QDMA_NUM_QUEUES` 改为 per-SoC 运行时值 `(eth->soc->num_tx_queues)` | 依赖 `eth` 处于作用域 |
-| 3 | `999-zzz-5113` | `#define MTK_QDMA_QUEUE_MASK GENMASK(15, 0)` | **`0xFFFF`** |
+| 3 | `999-zzz-5113`（**已于 2026-10-22 删除**） | `#define MTK_QDMA_QUEUE_MASK GENMASK(15, 0)` | **`0xFFFF`** |
 
 > ⚠️ 第 3 步是致命的。`0xFFFF` 覆盖 bit0..15，其中 bit8 以上是 conntrack / fwmark 的地盘，
 > bit7 是 `HNAT_EXCEPTION_BIT`，都不是队列位。
 >
 > ⚠️ 第 2 步也不能回退：若走 per-SoC 表达式，需要 `struct mtk_eth *eth` 在当前作用域，
 > 而 `hnat_nf_hook.c` 里该函数内的 `eth` 实际是 `struct ethhdr eth`（以太网头），**直接编译失败**。
+>
+> ℹ️ `999-zzz-5113` 曾把队列数强设为 64（V2/V3）。2026-10-13 的 MTK feeds 带来了官方补丁
+> `999-eth-56`（改编自 OpenWrt upstream 795-04，作者 chak-kei.lam），已实现同样的
+> "per-SoC 队列数 + `qdma.page` 寄存器分页"，且更完善（page 复位、`dev->num_tx_queues` 校验）。
+> 5113 的 4 个 hunk 因此全部失效（replay 验证：3/3 + 1/1 FAILED），会中止构建，已删除。
+> 删除后 `MTK_QDMA_QUEUE_MASK` = `(eth->soc->num_tx_queues) - 1` = **15**（多数 SoC）或 **31**（MT7988）。
 
 因此**禁止**在自定义判定里复用 `MTK_QDMA_QUEUE_MASK`。
 
@@ -293,7 +299,7 @@ hnat shortpkt: TCP ACK -> qid <short_pkt_qid>
 | `.../mtk_hnat/hnat_nf_hook.c:4207` | `skb->mark & HNAT_EXCEPTION_BIT` 判定 |
 | `target/linux/mediatek/patches-6.12/999-eth-26` | 引入 `MTK_QDMA_QUEUE_MASK` |
 | `target/linux/mediatek/patches-6.12/999-eth-56` | NUM_QUEUES 改 per-SoC 运行时值 |
-| `target/linux/mediatek/patches-6.12/999-zzz-5113` | MASK 改 `GENMASK(15,0)` ← 失效根因 |
+| ~~`target/linux/mediatek/patches-6.12/999-zzz-5113`~~ | MASK 改 `GENMASK(15,0)`；队列数强设 64。**已删除**（被 `999-eth-56` 取代，见第 2 节） |
 | `target/linux/mediatek/patches-6.12/999-zzz-5119` | short-pkt debugfs 节点 + 新掩码宏 + 清表 |
 | `target/linux/mediatek/patches-6.12/999-zzz-5120` | short-pkt 调度判定（使用新掩码） |
 | `package/mtk/applications/luci-app-eqos-mtk/root/usr/sbin/eqos` | 用户态：`apply_short_pkt()` 置 `qos_toggle=1` 再开 `short_pkt_toggle`；`emit_priority_mark()` 做 nft 侧小包 rescue |
