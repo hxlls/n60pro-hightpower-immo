@@ -8,7 +8,9 @@ games and other latency-sensitive small flows get prioritized even on
 
 Flows that already carry an explicit queue id via skb->mark (custom
 priority rules / device rules) keep their queue; auto detection only
-applies to otherwise unclassified traffic.
+applies to otherwise unclassified traffic. Only genuine short packets
+are redirected, so the bulk packets of a classified flow still use the
+queue their rule selected.
 
 The "unclassified" test no longer uses MTK_QDMA_QUEUE_MASK: after the
 64-queue rework that mask became GENMASK(15, 0), so `!(skb->mark &
@@ -18,17 +20,22 @@ did nothing. HNAT_QDMA_QUEUE_MASK is used instead, restricted to the
 bits below HNAT_EXCEPTION_BIT (bit 0..6 on netsys v2/v3, bit 0..3 on
 v1.x), matching how the HQoS path reads the id back, and compared
 against MAX_PPPQ_QUEUE_NUM, the threshold the PPPQ/HQoS code above
-uses to tell an explicit queue hint from a per-port queue. Stay out of
-the way when HQoS is active so user rules keep their precedence.
+uses to tell an explicit queue hint from a per-port queue.
+
+The check is deliberately not gated on !IS_HQOS_MODE. HQoS is what
+turns the skb->mark -> QDMA queue mapping on in the first place, and
+luci-app-eqos-mtk sets qos_toggle to 1 (HQoS) right before enabling
+short_pkt_toggle, so excluding it made the feature a no-op for every
+user configuring it from the UI.
 
 Signed-off-by: hxlls <hxlls@users.noreply.github.com>
 ---
 
 diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-index a1675f4..b069e14 100644
+index a1675f4..2a4d766 100644
 --- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
 +++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
-@@ -3074,7 +3074,64 @@ hnat_entry_bind:
+@@ -3074,7 +3074,72 @@ hnat_entry_bind:
  	else
  		qid = 0;
  
@@ -42,7 +49,15 @@ index a1675f4..b069e14 100644
 +	 * priority rules / device rules) keep that queue; auto detection only
 +	 * applies to otherwise unclassified traffic, i.e. to flows whose
 +	 * mark is below MAX_PPPQ_QUEUE_NUM, exactly how the PPPQ/HQoS code
-+	 * above classifies them.
++	 * above classifies them.  Note that only genuine short packets are
++	 * redirected below - bulk packets of a classified flow keep the queue
++	 * their rule selected.
++	 *
++	 * Deliberately not gated on !IS_HQOS_MODE: HQoS mode is exactly what
++	 * turns the skb->mark -> QDMA queue mapping on, so luci-app-eqos-mtk
++	 * sets qos_toggle to 1 (HQoS) before enabling short_pkt_toggle.
++	 * Excluding HQoS here would make the feature a no-op for every user
++	 * who configures it from the UI.
 +	 *
 +	 * HNAT_QDMA_QUEUE_MASK covers only the queue bits, i.e. everything
 +	 * below HNAT_EXCEPTION_BIT (netsys v2/v3 use bit 0..6, v1.x bit 0..3),
@@ -51,7 +66,7 @@ index a1675f4..b069e14 100644
 +	 * became GENMASK(15, 0) in this tree, covering bits that carry no queue
 +	 * number at all, which makes this whole block silently never match.
 +	 */
-+	if (short_pkt_toggle && !IS_HQOS_MODE &&
++	if (short_pkt_toggle &&
 +	    (skb->mark & HNAT_QDMA_QUEUE_MASK) < MAX_PPPQ_QUEUE_NUM) {
 +		if (h_proto == ETH_P_IP) {
 +			iph = (struct iphdr *)(skb_network_header(skb) + h_offset);
