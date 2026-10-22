@@ -302,6 +302,7 @@ hnat shortpkt: TCP ACK -> qid <short_pkt_qid>
 | ~~`target/linux/mediatek/patches-6.12/999-zzz-5113`~~ | MASK 改 `GENMASK(15,0)`；队列数强设 64。**已删除**（被 `999-eth-56` 取代，见第 2 节） |
 | `target/linux/mediatek/patches-6.12/999-zzz-5119` | short-pkt debugfs 节点 + 新掩码宏 + 清表 |
 | `target/linux/mediatek/patches-6.12/999-zzz-5120` | short-pkt 调度判定（使用新掩码） |
+| `target/linux/mediatek/patches-6.12/999-zzz-5121` | HNAT 侧全部改用自有宏，禁止引用 per-SoC QDMA 宏（见第 10 节） |
 | `package/mtk/applications/luci-app-eqos-mtk/root/usr/sbin/eqos` | 用户态：`apply_short_pkt()` 置 `qos_toggle=1` 再开 `short_pkt_toggle`；`emit_priority_mark()` 做 nft 侧小包 rescue |
 | `.../luci-app-eqos-mtk/htdocs/.../eqos.js` | LuCI 界面：`short_pkt_priority` / `short_pkt_len` / `short_pkt_qid` |
 
@@ -316,3 +317,36 @@ hnat shortpkt: TCP ACK -> qid <short_pkt_qid>
 5. 确认 `luci-app-eqos-mtk` 的 `apply_short_pkt()` 仍在开 `short_pkt_toggle` 前把 `qos_toggle` 置为 1；
    若它改为不再设 HQoS，则需相应调整第 5 节的前提
 6. 确认短包判定时**没有**被加回 `!IS_HQOS_MODE` 之类的 HQoS 排除条件（第 5 节的已知陷阱）
+7. 确认 HNAT 目录（`mtk_hnat/`）下**没有任何**对 `MTK_QDMA_QUEUE_MASK` /
+   `MTK_QDMA_NUM_QUEUES` 的引用（第 10 节的已知陷阱）：
+   `grep -rn "MTK_QDMA_QUEUE_MASK\|MTK_QDMA_NUM_QUEUES" target/linux/mediatek/files-6.12/drivers/net/ethernet/mediatek/mtk_hnat/ | grep -v hnat.h`
+
+---
+
+## 10. HNAT 文件禁止引用 per-SoC QDMA 宏
+
+`999-eth-56` 之后，`mtk_eth_soc.h` 中的两个宏变成了 per-SoC 运行时形式，**展开需要
+当前作用域存在 `struct mtk_eth *eth`**：
+
+```c
+#define MTK_QDMA_NUM_QUEUES  (eth->soc->num_tx_queues)
+#define MTK_QDMA_QUEUE_MASK  (MTK_QDMA_NUM_QUEUES - 1)
+```
+
+HNAT 的文件里没有这个 `eth`，反而有同名遮蔽：
+
+| 文件 / 函数 | 该作用域的 `eth` | 引用 per-SoC 宏的后果 |
+|---|---|---|
+| `hnat_nf_hook.c` `hnat_bind_crypto_entry()` | `struct ethhdr eth`（**值**，非指针） | `eth.soc` 编译错误 |
+| `hnat_nf_hook.c` `skb_to_hnat_info()` | `struct ethhdr *eth` | `eth->soc` 类型错误 |
+| `hnat_api.c` `hnat_entry_set_hqos()` | 无 | 未定义标识符 |
+| `hnat_debugfs.c` `hnat_init_debugfs()` | 无 | 未定义标识符 |
+
+这曾是 5113（硬编码 64 / `GENMASK(15,0)` 常量）掩盖的隐患：5113 存在时这些引用能编译，
+**删除 5113 当天就炸**（`hnat_nf_hook.o Error 1`）。
+
+处理（`999-zzz-5121`）：HNAT 侧一律用自有宏——队列判定用 `HNAT_QDMA_QUEUE_MASK`，
+队列数上限用新增的 `HNAT_QDMA_NUM_QUEUES`（=32，最宽 `num_tx_queues`），
+`hnat_ppd_xmit()` 直接以 `dev->real_num_tx_queues` 为界去掉 QDMA 约束。
+`mtk_eth_soc.c` / `mtk_eth_dbg.c` / `mtk_ppe_offload.c` / `mtk_ppe_debugfs.c`
+的作用域里有真 `struct mtk_eth *eth`，无需改动。
