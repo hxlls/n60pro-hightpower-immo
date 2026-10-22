@@ -1,0 +1,121 @@
+hnat: stop using the per-SoC QDMA macros inside the HNAT files
+
+Dropping 999-zzz-5113 (the 64-queue rework, superseded by the official
+999-eth-56) restored MTK_QDMA_QUEUE_MASK / MTK_QDMA_NUM_QUEUES to their
+per-SoC form:
+
+    #define MTK_QDMA_NUM_QUEUES  (eth->soc->num_tx_queues)
+    #define MTK_QDMA_QUEUE_MASK  (MTK_QDMA_NUM_QUEUES - 1)
+
+While 5113 was in the tree both were constants (64 / GENMASK(15, 0)), so
+the HNAT files compiled. Now every use requires a `struct mtk_eth *eth`
+in scope, and no HNAT file has one: hnat_bind_crypto_entry() and
+skb_to_hnat_info() shadow eth with a struct ethhdr (a value and a
+pointer respectively), hnat_entry_set_hqos() has none at all. The build
+therefore breaks in drivers/net/ethernet/mediatek/mtk_hnat/.
+
+Use the HNAT-local macros instead. They need no eth and describe the
+queue bits HNAT actually puts into skb->mark:
+
+- HNAT_QDMA_QUEUE_MASK for the queue decisions in hnat_bind_crypto_entry()
+  and skb_to_hnat_info(), and for the hqos qid in hnat_entry_set_hqos()
+- HNAT_QDMA_NUM_QUEUES (32, the widest num_tx_queues) for the qdma_txq
+  symlink loop in hnat_init_debugfs()
+- hnat_ppd_xmit() simply drops the QDMA bound: dev->real_num_tx_queues
+  is the limit skb_set_queue_mapping() needs anyway and is already
+  checked to be non-zero right above
+
+Signed-off-by: hxlls <hxlls@users.noreply.github.com>
+---
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
+index 8b9576e..f9b31ed 100644
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat.h
+@@ -1559,6 +1559,13 @@ extern int tnl_toggle;
+ 	  hnat_priv->data->version == MTK_HNAT_V3) ?				\
+ 		 HNAT_QDMA_QUEUE_MASK_MORE : HNAT_QDMA_QUEUE_MASK_LESS)
+ 
++/* Number of QDMA TX queues HNAT creates debugfs entries for. The
++ * per-SoC value lives in mtk_soc_data::num_tx_queues and is not
++ * reachable from the HNAT files (see above), so use the widest one
++ * the driver knows about (32 on MT7988, 16 elsewhere).
++ */
++#define HNAT_QDMA_NUM_QUEUES			32
++
+ extern int short_pkt_toggle;
+ extern int short_pkt_qid;
+ extern int short_pkt_len;
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_api.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_api.c
+index 427d470..427f356 100644
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_api.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_api.c
+@@ -419,11 +419,11 @@ static int hnat_entry_set_hqos(struct foe_entry *entry, void *data)
+ 	if (!d || !entry)
+ 		return HNAT_FAIL;
+ 
+-	if (d->qid >= MTK_QDMA_NUM_QUEUES)
++	if (d->qid > HNAT_QDMA_QUEUE_MASK)
+ 		return HNAT_FAIL;
+ 
+ 	fqos = (d->fqos) ? 1 : 0;
+-	qid = d->qid & MTK_QDMA_QUEUE_MASK;
++	qid = d->qid & HNAT_QDMA_QUEUE_MASK;
+ 
+ 	if (IS_IPV4_GRP(entry)) {
+ 		if (entry->ipv4_hnapt.iblk2.fqos == fqos &&
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
+index 54a3136..13a08ac 100644
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_debugfs.c
+@@ -4413,7 +4413,7 @@ int hnat_init_debugfs(struct mtk_hnat *h)
+ 		debugfs_create_symlink(name, root, name_symlink);
+ 	}
+ 
+-	for (i = 0; i < MTK_QDMA_NUM_QUEUES; i++) {
++	for (i = 0; i < HNAT_QDMA_NUM_QUEUES; i++) {
+ 		ret = snprintf(name, sizeof(name), "qdma_txq%ld", i);
+ 		if (ret != strlen(name)) {
+ 			ret = -ENOMEM;
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+index 2a4d766..d41e018 100644
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+@@ -785,8 +785,7 @@ static int hnat_ppd_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		return -ENETDOWN;
+ 	}
+ 
+-	queue = min_t(u16, MTK_QDMA_NUM_QUEUES - 1,
+-		      dev->real_num_tx_queues - 1);
++	queue = dev->real_num_tx_queues - 1;
+ 	skb->dev = dev;
+ 	skb_set_queue_mapping(skb, queue);
+ 
+@@ -2425,10 +2424,10 @@ hnat_skip_fill_inner:
+ 		entry.ipv6_5t_route.pppoe_id = hw_path.pppoe_sid;
+ 	}
+ 
+-	if (IS_HQOS_MODE || (skb->mark & MTK_QDMA_QUEUE_MASK) >= MAX_PPPQ_QUEUE_NUM)
+-		qid = skb->mark & (MTK_QDMA_QUEUE_MASK);
++	if (IS_HQOS_MODE || (skb->mark & HNAT_QDMA_QUEUE_MASK) >= MAX_PPPQ_QUEUE_NUM)
++		qid = skb->mark & (HNAT_QDMA_QUEUE_MASK);
+ 	else if (IS_PPPQ_MODE && IS_PPPQ_PATH(dev, skb))
+-		qid = ((port_id >= 0) ? MTK_GMAC_ID_MAX + port_id : mac->id) & MTK_QDMA_QUEUE_MASK;
++		qid = ((port_id >= 0) ? MTK_GMAC_ID_MAX + port_id : mac->id) & HNAT_QDMA_QUEUE_MASK;
+ 	else
+ 		qid = 0;
+ 
+@@ -3067,10 +3066,10 @@ hnat_entry_bind:
+ 		return -1;
+ 	}
+ 
+-	if (IS_HQOS_MODE || (skb->mark & MTK_QDMA_QUEUE_MASK) >= MAX_PPPQ_QUEUE_NUM)
+-		qid = skb->mark & (MTK_QDMA_QUEUE_MASK);
++	if (IS_HQOS_MODE || (skb->mark & HNAT_QDMA_QUEUE_MASK) >= MAX_PPPQ_QUEUE_NUM)
++		qid = skb->mark & (HNAT_QDMA_QUEUE_MASK);
+ 	else if (IS_PPPQ_MODE && IS_PPPQ_PATH(dev, skb))
+-		qid = ((port_id >= 0) ? MTK_GMAC_ID_MAX + port_id : mac->id) & MTK_QDMA_QUEUE_MASK;
++		qid = ((port_id >= 0) ? MTK_GMAC_ID_MAX + port_id : mac->id) & HNAT_QDMA_QUEUE_MASK;
+ 	else
+ 		qid = 0;
+ 
