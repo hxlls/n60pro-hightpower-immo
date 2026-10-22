@@ -1,3 +1,57 @@
+DTS: mt7981b -- hnat enable, ethsys sync and mtwifi support
+(merged from former 999-zzz-5003/5004/5005; content unchanged)
+
+--- a/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
+@@ -552,7 +552,12 @@
+ 			resets = <&ethsys 0>;
+ 			reset-names = "mtketh";
+ 			mtketh-soc = <&eth>;
+-			status = "disabled";
++			status = "okay";
++			mtketh-wan = "eth1";
++			mtketh-lan = "lan";
++			mtketh-max-gmac = <2>;
++			mtketh-ppe-num = <2>;
++			ext-devices-prefix = "wwan", "usb", "eth";
+ 		};
+ 
+ 		ap2woccif: ap2woccif@151a5000 {
+--- a/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
+@@ -10,6 +10,7 @@
+ #include <dt-bindings/pinctrl/mt65xx.h>
+ #include <dt-bindings/phy/phy.h>
+ #include <dt-bindings/reset/mt7986-resets.h>
++#include <dt-bindings/reset/ti-syscon.h>
+ 
+ / {
+ 	compatible = "mediatek,mt7981b";
+@@ -438,12 +439,21 @@
+ 			};
+ 		};
+ 
+-		ethsys: clock-controller@15000000 {
+-			compatible = "mediatek,mt7981-ethsys", "syscon";
++		ethsys: syscon@15000000 {
++			#address-cells = <1>;
++			#size-cells = <1>;
++			compatible = "mediatek,mt7981-ethsys",
++							"syscon";
+ 			reg = <0 0x15000000 0 0x1000>;
+ 			#clock-cells = <1>;
+ 			#reset-cells = <1>;
+-		};
++
++			ethsysrst: reset-controller {
++				compatible = "ti,syscon-reset";
++				#reset-cells = <1>;
++				ti,reset-bits = <0x34 4 0x34 4 0x34 4 (ASSERT_SET | DEASSERT_CLEAR | STATUS_SET)>;
++			};
++        };
+ 
+ 		wed: wed@15010000 {
+ 			compatible = "mediatek,mt7981-wed",
 --- a/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
 +++ b/arch/arm64/boot/dts/mediatek/mt7981b.dtsi
 @@ -99,18 +99,23 @@

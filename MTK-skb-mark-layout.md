@@ -300,9 +300,7 @@ hnat shortpkt: TCP ACK -> qid <short_pkt_qid>
 | `target/linux/mediatek/patches-6.12/999-eth-26` | 引入 `MTK_QDMA_QUEUE_MASK` |
 | `target/linux/mediatek/patches-6.12/999-eth-56` | NUM_QUEUES 改 per-SoC 运行时值 |
 | ~~`target/linux/mediatek/patches-6.12/999-zzz-5113`~~ | MASK 改 `GENMASK(15,0)`；队列数强设 64。**已删除**（被 `999-eth-56` 取代，见第 2 节） |
-| `target/linux/mediatek/patches-6.12/999-zzz-5119` | short-pkt debugfs 节点 + 新掩码宏 + 清表 |
-| `target/linux/mediatek/patches-6.12/999-zzz-5120` | short-pkt 调度判定（使用新掩码） |
-| `target/linux/mediatek/patches-6.12/999-zzz-5121` | HNAT 侧全部改用自有宏，禁止引用 per-SoC QDMA 宏（见第 10 节） |
+| ~~`999-zzz-5119` / `5120` / `5121`~~ | short-pkt 全部实现。**2026-10-22 已折叠进 `files-6.12` 源码，补丁删除**（见第 11 节） |
 | `package/mtk/applications/luci-app-eqos-mtk/root/usr/sbin/eqos` | 用户态：`apply_short_pkt()` 置 `qos_toggle=1` 再开 `short_pkt_toggle`；`emit_priority_mark()` 做 nft 侧小包 rescue |
 | `.../luci-app-eqos-mtk/htdocs/.../eqos.js` | LuCI 界面：`short_pkt_priority` / `short_pkt_len` / `short_pkt_qid` |
 
@@ -313,7 +311,8 @@ hnat shortpkt: TCP ACK -> qid <short_pkt_qid>
 1. 重新确认 `MTK_QDMA_QUEUE_MASK` 是否被再次改写（`grep -rn "define MTK_QDMA_QUEUE_MASK" target/linux/mediatek/patches-6.12/`）
 2. 重新确认 `MAX_PPPQ_QUEUE_NUM` 与 `MAX_SWITCH_PORT_NUM` 是否变化
 3. 确认 `HNAT_EXCEPTION_BIT` 是否仍是 `BIT(7)`；若变化，`HNAT_QDMA_QUEUE_MASK` 需同步调整（它应始终等于 exception bit 以下的所有位）
-4. 重跑补丁链回放：`999-zzz-5101` ~ `5120` 应全部干净应用
+4. 重跑补丁链回放：全树补丁应全部干净应用（2026-10-22 起自有补丁仅剩 5 个：
+   `5000`/`5001`/`5101`/`5117`/`5300`，其余已折叠进 `files-6.12`，见第 11 节）
 5. 确认 `luci-app-eqos-mtk` 的 `apply_short_pkt()` 仍在开 `short_pkt_toggle` 前把 `qos_toggle` 置为 1；
    若它改为不再设 HQoS，则需相应调整第 5 节的前提
 6. 确认短包判定时**没有**被加回 `!IS_HQOS_MODE` 之类的 HQoS 排除条件（第 5 节的已知陷阱）
@@ -345,8 +344,40 @@ HNAT 的文件里没有这个 `eth`，反而有同名遮蔽：
 这曾是 5113（硬编码 64 / `GENMASK(15,0)` 常量）掩盖的隐患：5113 存在时这些引用能编译，
 **删除 5113 当天就炸**（`hnat_nf_hook.o Error 1`）。
 
-处理（`999-zzz-5121`）：HNAT 侧一律用自有宏——队列判定用 `HNAT_QDMA_QUEUE_MASK`，
+处理：HNAT 侧一律用自有宏——队列判定用 `HNAT_QDMA_QUEUE_MASK`，
 队列数上限用新增的 `HNAT_QDMA_NUM_QUEUES`（=32，最宽 `num_tx_queues`），
 `hnat_ppd_xmit()` 直接以 `dev->real_num_tx_queues` 为界去掉 QDMA 约束。
 `mtk_eth_soc.c` / `mtk_eth_dbg.c` / `mtk_ppe_offload.c` / `mtk_ppe_debugfs.c`
 的作用域里有真 `struct mtk_eth *eth`，无需改动。
+
+---
+
+## 11. 自有补丁的折叠策略（2026-10-22 起）
+
+为降低跟随父仓库/feeds 同步的维护成本，自有补丁只保留**必须与上游共享文件**的部分：
+
+| 保留的补丁 | 原因 |
+|---|---|
+| `999-zzz-5000`（mt7986a dts） | 改 `mt7986a.dtsi`，上游 115/194/197/199 等补丁也改它 |
+| `999-zzz-5001`（mt7981b dts） | 改 `mt7981b.dtsi`，上游 117/999-dts-* 等补丁也改它 |
+| `999-zzz-5101`（mtk_eth_soc 合并） | 改 `mtk_eth_soc.c`，generic 702/721/730/732 + feeds 也改它 |
+| `999-zzz-5117`（Kconfig 依赖） | feeds `999-eth-91` 等也改该 Kconfig |
+| `999-zzz-5300`（xfrm 检查） | feeds `999-ppe-29/38` 等也改该文件 |
+
+其中 5000/5001 是原 6 个 DTS 补丁合并（每 SoC 一个），5101 是原
+5101/5106/5110 三个 `mtk_eth_soc.c` 补丁合并；内容均未变。
+
+**已折叠进 `files-6.12`（补丁删除，共 21 个）**：5102~5121 中除 5101/5106/5110/5117
+外的全部 HNAT 补丁（5102-5105、5107-5109、5111、5112、5114、5115、5116、5118、
+5119、5120、5121），以及 5200-5204 全部 wifi_utility/iwconfig 补丁。
+折叠方式：把回放树（全部补丁应用后的最终态）中对应文件直接拷入
+`target/linux/mediatek/files-6.12/`。这些文件没有任何上游补丁触碰，
+因此折叠后与上游**零交互**——feeds 更新时不会再产生冲突或 fuzz。
+
+折叠后 short-pkt-qos 的实现位置（不再是补丁）：
+- `files-6.12/.../mtk_hnat/hnat.h`：`HNAT_QDMA_QUEUE_MASK`、`HNAT_QDMA_NUM_QUEUES`
+- `files-6.12/.../mtk_hnat/hnat_debugfs.c`：`short_pkt_toggle/qid/len` 节点 + 写时清表
+- `files-6.12/.../mtk_hnat/hnat_nf_hook.c`：短包调度判定（第 4 节）
+
+验证：折叠/合并后全树补丁回放（1056 个）0 失败，且最终内核树与
+折叠前逐字节一致（`backup-011515/replay.sh` + 目录 diff）。

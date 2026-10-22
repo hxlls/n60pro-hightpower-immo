@@ -1,3 +1,48 @@
+mtk_eth_soc: hnat skb magic check, disable tnl on NETSYS_V2, rx-ppd redirect
+(merged from former 999-zzz-5101/5106/5110; content unchanged)
+
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -2272,6 +2272,13 @@ next_frag:
+ 	state.tx_buf->type = MTK_TYPE_SKB;
+ 	state.tx_buf->data = skb;
+ 
++#if defined(CONFIG_NET_MEDIATEK_HNAT) || defined(CONFIG_NET_MEDIATEK_HNAT_MODULE)
++	if (HNAT_SKB_CB2(skb)->magic == 0x78681415) {
++		itxd->txd4 &= ~(0xf << TX_DMA_FPORT_SHIFT_V2);
++		itxd->txd4 |= 0x3 << TX_DMA_FPORT_SHIFT_V2;
++	}
++#endif
++
+ 	netdev_tx_sent_queue(txq, skb->len);
+ 	skb_tx_timestamp(skb);
+ 
+--- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
++++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
+@@ -1974,7 +1974,9 @@ static void mtk_tx_set_dma_desc_v2(struc
+ 	data |= TX_DMA_SWC_V2 | QID_BITS_V2(info->qid);
+ 
+ 	/* Set tport */
+-	data |= FIELD_PREP(TX_DMA_TPORT_MASK, info->tport);
++	if (mtk_is_netsys_v3_or_greater(eth)) {
++		data |= FIELD_PREP(TX_DMA_TPORT_MASK, info->tport);
++	}
+ 	WRITE_ONCE(desc->txd4, data);
+ 
+ 	data = 0;
+@@ -1997,8 +1999,10 @@ static void mtk_tx_set_dma_desc_v2(struc
+ 	WRITE_ONCE(desc->txd7, 0);
+ 
+ 	data = 0;
+-	data |= FIELD_PREP(TX_DMA_TOPS_ENTRY_MASK, info->tops_entry);
+-	data |= FIELD_PREP(TX_DMA_CDRT_MASK, info->cdrt);
++	if (mtk_is_netsys_v3_or_greater(eth)) {
++		data |= FIELD_PREP(TX_DMA_TOPS_ENTRY_MASK, info->tops_entry);
++		data |= FIELD_PREP(TX_DMA_CDRT_MASK, info->cdrt);
++	}
+ 	WRITE_ONCE(desc->txd8, data);
+ }
+ 
 --- a/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 +++ b/drivers/net/ethernet/mediatek/mtk_eth_soc.c
 @@ -377,6 +377,9 @@ static const char * const mtk_reset_even
