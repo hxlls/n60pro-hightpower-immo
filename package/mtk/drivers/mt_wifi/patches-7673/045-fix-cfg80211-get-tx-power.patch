@@ -1,0 +1,113 @@
+--- a/mt_wifi/os/linux/cfg80211/cfg80211.c	2026-10-23 19:57:40.246373096 +0000
++++ b/mt_wifi/os/linux/cfg80211/cfg80211.c	2026-10-23 19:57:40.253504182 +0000
+@@ -783,7 +783,6 @@
+ 
+ 
+ #if (KERNEL_VERSION(2, 6, 32) <= LINUX_VERSION_CODE)
+-#if (KERNEL_VERSION(3, 8, 0) > LINUX_VERSION_CODE)
+ /*
+  * ========================================================================
+  * Routine Description:
+@@ -846,10 +845,88 @@
+ #endif
+ 	IN int								*pdBm)
+ {
++	RTMP_ADAPTER *pAd = NULL;
++	struct wifi_dev *pDrvWdev = NULL;
++	INT32 TxPwr = 0, Tx_Pwr = 0;
++	UINT8 BandIdx = 0;
++	UINT32 RetryCnt = 0;
++	UINT32 u4Omac = 0, u4Cmac = 0;
++	UCHAR apidx = 0;
++	static ULONG u4LastTxPwrDbg = 0;
++
+ 	CFG80211DBG(DBG_LVL_INFO, ("80211> %s ==>\n", __func__));
++
++	if (wdev == NULL || wdev->netdev == NULL)
++		return -EOPNOTSUPP;
++
++	MAC80211_PAD_GET(pAd, pWiphy);
++
++	pDrvWdev = RTMP_OS_NETDEV_GET_WDEV(wdev->netdev);
++	if (pDrvWdev == NULL)
++		return -EOPNOTSUPP;
++
++#ifdef MGMT_TXPWR_CTRL
++	BandIdx = HcGetBandByWdev(pDrvWdev);
++	if (BandIdx >= DBDC_BAND_NUM)
++		return -EOPNOTSUPP;
++
++	if (pAd->ApCfg.MgmtTxPwr[BandIdx] == 0) {
++		MtCmdTxPwrShowInfo(pAd, TXPOWER_ALL_RATE_POWER_INFO, BandIdx);
++		while ((pAd->ApCfg.MgmtTxPwr[BandIdx] == 0) && (RetryCnt < 20)) {
++			OS_WAIT(1);
++			RetryCnt++;
++		}
++	}
++
++	/* 0.5 dBm units, same formula as the wext SIOCGIWTXPOW handler */
++	TxPwr = pAd->ApCfg.MgmtTxPwr[BandIdx] + pAd->ApCfg.EpaFeGain[BandIdx] + pDrvWdev->TxPwrDelta;
++	Tx_Pwr = TxPwr / 2;
++
++	if (Tx_Pwr <= 0) {
++		/* firmware reported nothing: read CCK/OFDM power from the MAC registers */
++		{
++			UINT32 u4Omac = 0, u4Cmac = 0;
++			INT32 i4OfdmPwr = 0, i4CckPwr = 0;
++
++			if (BandIdx == BAND0) {
++				MAC_IO_READ32(pAd->hdev_ctrl, 0x21024, &u4Omac);
++				MAC_IO_READ32(pAd->hdev_ctrl, 0x21020, &u4Cmac);
++			} else {
++				MAC_IO_READ32(pAd->hdev_ctrl, 0xa1024, &u4Omac);
++				MAC_IO_READ32(pAd->hdev_ctrl, 0xa1020, &u4Cmac);
++			}
++
++			if ((u4Cmac & 0xff) <= 0x3f)
++				i4CckPwr = ((INT32)(u4Cmac & 0xff) >> 1);
++			else
++				i4CckPwr = (((INT32)((u4Cmac & 0xff) - 0x80) >> 1) | 0x80000000);
++
++			if ((u4Omac & 0xff) <= 0x3f)
++				i4OfdmPwr = ((INT32)(u4Omac & 0xff) >> 1);
++			else
++				i4OfdmPwr = (((INT32)((u4Omac & 0xff) - 0x80) >> 1) | 0x80000000);
++
++			Tx_Pwr = (i4OfdmPwr > i4CckPwr) ? i4OfdmPwr : i4CckPwr;
++
++			if (RTMP_TIME_AFTER(jiffies, u4LastTxPwrDbg + 5 * HZ)) {
++				u4LastTxPwrDbg = jiffies;
++				MTWF_PRINT("[txpwr] apidx=%d band=%d MgmtTxPwr=%d EPA=%d Delta=%d omac=0x%08x cmac=0x%08x -> %d dBm\n",
++					apidx, BandIdx, pAd->ApCfg.MgmtTxPwr[BandIdx],
++					pAd->ApCfg.EpaFeGain[BandIdx], pDrvWdev->TxPwrDelta,
++					(unsigned int)u4Omac, (unsigned int)u4Cmac, Tx_Pwr);
++			}
++		}
++	}
++
++	if (Tx_Pwr <= 0)
++		return -EOPNOTSUPP; /* still unknown: show N/A rather than a bogus 0 */
++
++	*pdBm = Tx_Pwr;
++	return 0;
++#else
+ 	return -EOPNOTSUPP;
++#endif /* MGMT_TXPWR_CTRL */
+ } /* End of CFG80211_OpsTxPwrGet */
+-#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(3,8,0) */
+ 
+ /*
+  * ========================================================================
+@@ -3743,12 +3820,10 @@
+ 
+ 
+ #if (KERNEL_VERSION(2, 6, 32) <= LINUX_VERSION_CODE)
+-#if (KERNEL_VERSION(3, 8, 0) > LINUX_VERSION_CODE)
+ 	/* set the transmit power according to the parameters */
+ 	.set_tx_power				= CFG80211_OpsTxPwrSet,
+ 	/* store the current TX power into the dbm variable */
+ 	.get_tx_power				= CFG80211_OpsTxPwrGet,
+-#endif /* LINUX_VERSION_CODE: 3.8.0 */
+ 	/* configure WLAN power management */
+ 	.set_power_mgmt				= CFG80211_OpsPwrMgmt,
+ 	/* get station information for the station identified by @mac */
