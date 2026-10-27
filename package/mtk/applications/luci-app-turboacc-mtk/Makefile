@@ -8,7 +8,7 @@ include $(TOPDIR)/rules.mk
 PKG_LICENSE:=GPL-3.0-only
 
 LUCI_TITLE:=LuCI support for MTK HNAT
-LUCI_DEPENDS:=+kmod-tcp-bbr @!PACKAGE_luci-app-turboacc
+LUCI_DEPENDS:=+kmod-tcp-bbr +kmod-tcp-bbr1 @!PACKAGE_luci-app-turboacc
 LUCI_PKGARCH:=all
 
 include $(TOPDIR)/feeds/luci/luci.mk
