@@ -282,8 +282,7 @@ return view.extend({
 				o.value(algos[i]);
 			}
 		}
-		o.default = 'cubic';
-		o.rmempty = false;
+		o.rmempty = true;
 
 
 		/* --------------------------------------------------- fullcone NAT tab */
