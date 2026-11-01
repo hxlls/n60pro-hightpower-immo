@@ -35,3 +35,4 @@ git-src
 .cproject
 .ccache
 .vscode*
+package/diy/luci-app-eqos-mtk-ex/
