@@ -1,0 +1,17 @@
+{
+	"luci-app-eqos-mtk-ex": {
+		"description": "Grant UCI access for luci-app-eqos-mtk-ex",
+		"read": {
+			"uci": [ "eqosex" ],
+			"ubus": {
+				"luci.eqosex": [ "getQueueStats", "getShortPkt", "getQueueMap" ]
+			},
+			"file": {
+				"/usr/sbin/eqosex": [ "exec" ]
+			}
+		},
+		"write": {
+			"uci": [ "eqosex" ]
+		}
+	}
+}

@@ -1,0 +1,1824 @@
+#!/bin/sh
+
+DEV_DEFAULT="br-lan"
+IFB_DEV="ifb-eqosex"
+HNAT_DIR="/sys/kernel/debug/hnat"
+NFT="/usr/sbin/nft"
+
+TABLE_FAMILY="inet"
+TABLE_NAME="eqosex"
+CHAIN_NAME="forward"
+MARK_CLEAR_MASK="0xffff0000"
+# HNAT tests bit 7 rather than an exact mark value.
+HNAT_EXCEPTION_BIT="0x80"
+HNAT_BIND_THRESHOLD=5
+HNAT_RESTART_DELAY=3
+
+# Every number below is a *fallback*, never a standard.  The QDMA layout is
+# defined by the kernel in the feed this firmware was built from, and the feed
+# changes: a queue count, a scheduler count or a rate ceiling is a compile-time
+# constant there, so hard-coding one here would silently become wrong on the
+# next bump.  Each value is therefore re-derived at runtime (detect_*), and the
+# constants only keep the script usable when a probe cannot run (plan/dry-run
+# off-device).
+#
+# Where the runtime values come from, in the tree that built this firmware:
+#   drivers/net/ethernet/mediatek/mtk_eth_soc.c
+#       .num_tx_queues            MT7986 = 16, MT7988 = 32   (patch 999-eth-56)
+#       for (i < (netsys_v2 ? 4 : 2)) qdma_sch%d             (patch 999-eth-90)
+#       mtk_qdma_debugfs_write_qos_queue(): 7 fields
+#           "scheduler min_en min_rate max_en max_rate weight resv"
+#       and it rejects min/max rate > 1000000 kbit/s on v2, > 10000000 on v3.
+#       mtk_device_event(): non-DSA port queue = mac->id, rewritten through
+#       mtk_set_queue_speed() on every link change -- a queue the driver owns
+#       loses whatever we wrote to it when the link flaps.
+#   mtk_hnat/hnat.h + hnat_nf_hook.c
+#       an offloaded flow only keeps our qid when qos_toggle == 1
+#       (IS_HQOS_MODE); otherwise a qid below MAX_PPPQ_QUEUE_NUM is replaced by
+#       the port mapping and the rule only looks applied.
+#
+# Upstream (mediatek/mtk-openwrt-feeds, logan_common/25.12) states the same
+# thing with runtime values rather than constants:
+#       #define HNAT_QDMA_NUM_QUEUES (hnat_priv->eth->soc->num_tx_queues)
+#       #define HNAT_QDMA_QUEUE_MASK (HNAT_QDMA_NUM_QUEUES - 1)
+#       #define MAX_PPPQ_QUEUE_NUM   (MTK_MAX_DEVS + 2 * PPPQ_DSA_QUEUE_NUM)
+#       #define PPPQ_DSA_QUEUE_NUM   READ_ONCE(hnat_priv->eth->dsa_queue_count)
+# The copy in this firmware replaces the first two with a compile-time 32 and
+# a fixed GENMASK(6,0), so a mark above the real queue count is accepted by the
+# driver and then points at a queue that does not exist.  That is why the pool
+# is capped by what the debugfs nodes accept, never by the mask.
+QDMA_QUEUE_COUNT=16
+QDMA_RATE_MAX=1000000
+TOTAL_RATE_MAX=1000
+SCH_COUNT=4
+UP_SCH=2
+DL_SCH=3
+UP_QID_BASE=1
+TC_SLOT_MAX=65535
+MANAGED_QID_LAST=14
+SHORT_PKT_QID=15
+DEFAULT_QUEUE_CFG="0 0 0 0 0 0 4"
+
+# Every queue carries the same weight.  Weight only decides a share while the
+# scheduler's total rate is saturated, and this build never sells more than
+# the line can carry: a client is either shaped to its own hard ceiling (so
+# the sum stays under the total and nothing is ever contested) or rejected.
+# One queue therefore has no reason to outrank another, and a fixed value
+# keeps a reused queue from inheriting a stale weight from a previous rule.
+WEIGHT_FIXED=4
+
+# How many times a queue write is retried when the readback disagrees.
+#
+# The driver brings HQoS up asynchronously, so a queue written while that is
+# still settling gets reset afterwards.  Each retry is one second apart, which
+# is far longer than the settling window; three attempts cover a slow boot
+# without hanging the service when the queue really is refused.
+PROGRAM_TRIES=3
+
+# The queue pool is flat, not split into an upload and a download half.
+# One queue id maps to a single shaper register pair, so upload and
+# download of the same client cannot share it; every (selector, direction)
+# pair needs a queue of its own.  A bidirectional client therefore costs
+# two queues and a one-directional client costs one.
+#
+# Two clients never share a queue, not even at the same rate.  A queue has
+# exactly one rate and one weight, so sharing would give both clients a
+# single budget (each ending up with half of what it asked for) or dilute
+# the share they compete with.  Neither is what the user typed, and a
+# silently wrong budget looks exactly like a bug -- so an over-subscribed
+# pool refuses the configuration instead of squeezing one more client in.
+POOL_QID_FIRST=1
+POOL_QID_LAST=14
+# Runtime directory.  EQOSEX_RUNDIR exists so the planner can be exercised
+# off-device; on a router this is always /var/run.
+EQOSEX_RUNDIR="${EQOSEX_RUNDIR:-/var/run}"
+
+QIDMAP_FILE="$EQOSEX_RUNDIR/eqosex.qidmap"
+
+# Set by plan_queues() when at least one rule had to be moved to a queue it
+# did not own before -- a new rule, or a gap that forced a renumber.  Only
+# then do the PPE bindings have to be dropped (see foe_clear()); a rate edit
+# leaves every binding intact, because the binding stores the queue id and
+# the shaper register is read per packet.
+REBIND_FILE="$EQOSEX_RUNDIR/eqosex.rebind"
+
+# Runtime state the GUI reads.  LAYOUT_FILE is a snapshot of what this SoC
+# actually exposed and where the pool boundaries ended up, so the web UI does
+# not have to probe the hardware itself -- reading a qdma_txq node clears its
+# counters, and the monitor's rate sampling would lose a window every time the
+# layout page refreshed.  TC_FILE lists the directions that fell back to
+# software shaping, which is otherwise only visible in syslog.
+LAYOUT_FILE="$EQOSEX_RUNDIR/eqosex.layout"
+TC_STATE_FILE="$EQOSEX_RUNDIR/eqosex.tc"
+
+# Legacy cleanup only.  An older build shaped the queue overflow with an
+# htb qdisc whose fingerprint is class 1:9.  That fallback is gone now (an
+# overflowing pool refuses the save instead of shaping in software), but a
+# device still carrying the qdisc after an upgrade has to have it removed,
+# and the fingerprint is what tells our htb apart from one someone else put
+# there.
+TC_DEFAULT_CLASS=9
+
+die() {
+	echo "eqosex: $*" >&2
+	exit 1
+}
+
+is_uinteger() {
+	case "$1" in
+		''|*[!0-9]*|0[0-9]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+valid_ipv4() {
+	[ -n "$1" ] || return 1
+
+	case "$1" in
+		*[!0-9./]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+valid_ipv6() {
+	[ -n "$1" ] || return 1
+
+	case "$1" in
+		*[!0-9A-Fa-f:./]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+need_nft() {
+	[ -x "$NFT" ] || die "nftables is not available"
+}
+
+need_hnat() {
+	[ -d "$HNAT_DIR" ] || insmod mtkhnat 2>/dev/null
+	[ -d "$HNAT_DIR" ] || die "HNAT debugfs is not available"
+}
+
+write_hnat() {
+	local node="$1"
+	local value="$2"
+
+	[ -w "$HNAT_DIR/$node" ] || die "$HNAT_DIR/$node is not writable"
+	printf '%s' "$value" > "$HNAT_DIR/$node" ||
+		die "failed to write $HNAT_DIR/$node"
+}
+
+# The driver only creates debugfs nodes for the QDMA queues it enables:
+# 16 on MT7981/MT7986, 32 on MT7988.  The hnat directory also carries
+# symlinks for qid0-31, but anything the driver did not create is a broken
+# link, so testing for writability is the only reliable capacity probe.
+compute_layout() {
+	local n="$1"
+
+	QDMA_QUEUE_COUNT="$n"
+	# The highest queue is normally reserved for the shared short-packet
+	# priority queue, so shaping never fights with it for the same register.
+	# With short-packet priority switched off nothing ever reads that queue,
+	# so it joins the pool instead: 15 queues instead of 14 on a 16-queue
+	# SoC.  Reading the config here (rather than only in apply_short_pkt)
+	# keeps the pool boundary and the priority queue in agreement -- the
+	# alternative would be a rule landing on qid15 and then silently
+	# colliding with the short-packet queue the moment it gets enabled.
+	SHORT_PKT_QID=$((n - 1))
+	if [ "${EQOSEX_SHORT_PKT:-0}" = "1" ] ||
+	   [ "$(uci -q get eqosex.config.short_pkt_priority 2>/dev/null)" = "1" ]; then
+		MANAGED_QID_LAST=$((n - 2))
+	else
+		MANAGED_QID_LAST=$((n - 1))
+	fi
+	POOL_QID_LAST="$MANAGED_QID_LAST"
+}
+
+detect_qdma_layout() {
+	local i n=0
+
+	for i in $(seq 0 63); do
+		[ -w "$HNAT_DIR/qdma_txq$i" ] && n=$((i + 1))
+	done
+
+	[ "$n" -ge 4 ] || die "only $n QDMA queues; layout needs at least 4"
+
+	compute_layout "$n"
+	write_layout
+}
+
+# How many shaping groups the running driver actually published.  NETSYS v2/v3
+# expose four (qdma_sch0..3), v1 exposes two.  MTK's own HQoS app groups the
+# lower half of the queues under sch0 and the upper half under sch1, so those
+# two ids are left to it and the per-direction caps live on the next pair.  On
+# a two-scheduler SoC there is no third pair, and the only way to keep an
+# upload and a download ceiling apart is to use 0 and 1.
+detect_schedulers() {
+	local i n=0
+
+	for i in 0 1 2 3 4 5 6 7; do
+		[ -e "$HNAT_DIR/qdma_sch$i" ] && n=$((i + 1))
+	done
+
+	SCH_COUNT="$n"
+
+	case "$n" in
+		0|1)
+			die "$n qdma scheduler(s); upload and download need one each"
+			;;
+		2|3)
+			UP_SCH=0
+			DL_SCH=1
+			;;
+		*)
+			UP_SCH=2
+			DL_SCH=3
+			;;
+	esac
+}
+
+# The largest rate a single queue accepts is validated in the driver, and the
+# ceiling differs between NETSYS v2 and v3.  Reading the SoC compatible keeps
+# this correct if either the SoC or the feed changes.
+detect_netsys() {
+	local compat=""
+
+	compat="$(tr -d '\000' < /proc/device-tree/soc/ethernet@15100000/compatible 2>/dev/null)"
+	[ -n "$compat" ] ||
+		compat="$(tr -d '\000' < /proc/device-tree/soc/ethernet*/compatible 2>/dev/null)"
+
+	case "$compat" in
+		*mt7988*|*mt7987*)
+			QDMA_RATE_MAX=10000000
+			;;
+		*)
+			QDMA_RATE_MAX=1000000
+			;;
+	esac
+}
+
+# Snapshot of the layout for the web UI.  Written here rather than probed by
+# rpcd because reading a qdma_txq debugfs node clears its counters, and the
+# monitor computes rates from them: a page refresh would otherwise swallow a
+# sampling window every time.
+write_layout() {
+	local short_pkt=0
+
+	[ "$(uci -q get eqosex.config.short_pkt_priority)" = "1" ] && short_pkt=1
+
+	printf 'qcount %s\nfirst %s\nlast %s\nshort_pkt %s\nshort_pkt_qid %s\n' \
+		"$QDMA_QUEUE_COUNT" "$POOL_QID_FIRST" "$POOL_QID_LAST" \
+		"$short_pkt" "$SHORT_PKT_QID" > "$LAYOUT_FILE"
+}
+
+need_qdma_layout() {
+	need_hnat
+	detect_netsys
+	detect_qdma_layout
+	detect_schedulers
+
+	for node in qdma_sch$UP_SCH qdma_sch$DL_SCH \
+		qdma_txq$POOL_QID_FIRST qdma_txq$POOL_QID_LAST; do
+		[ -w "$HNAT_DIR/$node" ] || die "$HNAT_DIR/$node is not writable"
+	done
+
+	[ -e "$HNAT_DIR/qdma_txq0" ] ||
+		die "qid0 is missing; expected $QDMA_QUEUE_COUNT-QDMA NETSYS layout"
+}
+
+# The device the software fallback shapes for a direction.  Download leaves
+# through the LAN bridge, upload through whatever carries the default route,
+# so both directions are shaped on egress devices and no ifb is involved.
+#
+# An ifb would be the obvious alternative for upload (mirror LAN ingress into
+# it), but a redirected packet re-enters the stack with iifname=ifb-eqosex,
+# which no firewall zone owns: fw4 then treats it as unassigned and drops it,
+# so the shaped client would simply lose its upload.
+tc_device() {
+	local dir="$1"
+	local dev
+
+	case "$dir" in
+		dl)
+			echo "$DEV_DEFAULT"
+			;;
+		up)
+			dev="$(ip -4 route show default 2>/dev/null |
+				sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+			[ -n "$dev" ] ||
+				dev="$(ip -6 route show default 2>/dev/null |
+					sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -n1)"
+			[ -n "$dev" ] || return 1
+			echo "$dev"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# htb 1: with class 1:$TC_DEFAULT_CLASS as its fingerprint: only a qdisc this
+# script created has that class, so a foreign htb on the same device is left
+# alone instead of being torn down.
+tc_qdisc_ours() {
+	local dev="$1"
+
+	tc qdisc show dev "$dev" 2>/dev/null | grep -q "qdisc htb 1:" || return 1
+	tc class show dev "$dev" 2>/dev/null | grep -qw "1:$TC_DEFAULT_CLASS"
+}
+
+stop_qos_dev() {
+	local dev="$1"
+
+	[ -n "$dev" ] || return 0
+	tc_qdisc_ours "$dev" || return 0
+
+	tc qdisc del dev "$dev" root 2>/dev/null
+}
+
+stop_qos() {
+	local dev
+
+	for dev in "$DEV_DEFAULT" "$(tc_device up 2>/dev/null)"; do
+		stop_qos_dev "$dev"
+	done
+
+	# Interface left behind by builds that mirrored ingress into an ifb.
+	[ -d "/sys/class/net/$IFB_DEV" ] || return 0
+
+	tc qdisc del dev "$DEV_DEFAULT" ingress 2>/dev/null
+	tc qdisc del dev "$IFB_DEV" root 2>/dev/null
+	ip link del dev "$IFB_DEV" 2>/dev/null
+}
+
+nft_stop() {
+	need_nft
+	"$NFT" delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null
+}
+
+nft_start() {
+	local dev="$1"
+
+	need_nft
+	nft_stop
+
+	"$NFT" -f - <<EOF || return 1
+table $TABLE_FAMILY $TABLE_NAME {
+	chain $CHAIN_NAME {
+		type filter hook forward priority mangle; policy accept;
+	}
+}
+EOF
+
+	"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+		iifname "$dev" meta mark '&' "$HNAT_EXCEPTION_BIT" == 0 \
+		meta mark set meta mark '&' "$MARK_CLEAR_MASK" || return 1
+	"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+		oifname "$dev" meta mark '&' "$HNAT_EXCEPTION_BIT" == 0 \
+		meta mark set meta mark '&' "$MARK_CLEAR_MASK" || return 1
+}
+
+reset_hnat_qdma() {
+	local i
+
+	need_qdma_layout
+	write_hnat "qdma_sch$UP_SCH" "0 wrr 0"
+	write_hnat "qdma_sch$DL_SCH" "0 wrr 0"
+
+	i=$UP_QID_BASE
+	while [ "$i" -le "$MANAGED_QID_LAST" ]; do
+		write_hnat "qdma_txq$i" "$DEFAULT_QUEUE_CFG"
+		i=$((i + 1))
+	done
+}
+
+# bridge-nf-call-iptables must be 0 on this firmware, and this script is what
+# enforces it.  Kernel default is 1 and the MTK HQoS template (feed/app/
+# mtkhnat_util/files/mtkhnat, hqos=1 branch) deliberately writes 1 -- its marks
+# are applied at the bridge layer, and the sysctl is what lets bridged frames
+# reach IP netfilter ("allow skb being marked").  Our marks are set on the
+# routed path instead, so we never need bridged frames in IP netfilter -- and
+# tproxy needs the routed path to be the only path: with the sysctl at 1 every
+# proxied session on this device died (A/B, 2026-11-01: 8/8 timeouts at 1,
+# 8/8 recovered at 0, reversible both ways).
+#
+# The node only exists once br_netfilter is loaded.  No node means bridged
+# frames bypass IP netfilter entirely, which is the state we want anyway, so
+# an absent node is not an error.  mtkhqos_util is deliberately not installed
+# on this firmware, so nothing else would ever write the 0.
+ensure_bridge_nf_off() {
+	local f cur
+
+	for f in /proc/sys/net/bridge/bridge-nf-call-iptables \
+		 /proc/sys/net/bridge/bridge-nf-call-ip6tables; do
+		[ -e "$f" ] || continue
+		cur="$(cat "$f" 2>/dev/null)"
+		[ "$cur" = "0" ] || printf '%s' 0 > "$f" 2>/dev/null
+		[ "$(cat "$f" 2>/dev/null)" = "0" ] || \
+			die "cannot keep $(basename "$f") at 0; proxied (tproxy) traffic would break"
+	done
+}
+
+start_hnat_qos() {
+	local dl="$1"
+	local up="$2"
+	local en max want floor
+
+	# The scheduler quantizes the requested rate (999000 kbit/s is kept as
+	# 990000, about 1% low), so the readback is accepted within 2% of the
+	# request instead of requiring an exact match.  An exact compare made
+	# every non-round save fail its own verification, and under LuCI's
+	# rollback-armed apply the whole change then reverted silently
+	# (2026-11-02: "999" was the value that exposed it).
+	rate_accepted() {
+		[ "$2" = "1" ] || return 1
+		want=$1
+		floor=$((want * 98 / 100))
+		[ "$3" -ge "$floor" ] && [ "$3" -le "$want" ]
+	}
+
+	need_qdma_layout
+	# qos_toggle=1 is not decoration.  hnat_nf_hook.c only keeps our qid on an
+	# offloaded flow when this is 1 (or when the qid is above the PPPQ bound,
+	# which the pool does not respect on purpose -- it starts at 1).  With 0,
+	# every offloaded flow is re-mapped to its port queue and the shaping we
+	# just programmed would never be applied to the traffic that matters.
+	write_hnat "qos_toggle" "1"
+	reset_hnat_qdma
+	write_hnat "qdma_sch$UP_SCH" "1 wrr $((up * 1000))"
+	write_hnat "qdma_sch$DL_SCH" "1 wrr $((dl * 1000))"
+
+	if [ "$(cat "$HNAT_DIR/qos_toggle" 2>/dev/null)" != "1" ]; then
+		logger -t eqosex "HQOS mode did not stay enabled; shaping will not reach offloaded flows"
+		return 1
+	fi
+
+	en="$(awk 'NR == 2 { print $1 }' "$HNAT_DIR/qdma_sch$UP_SCH" 2>/dev/null)"
+	max="$(awk 'NR == 2 { print $3 }' "$HNAT_DIR/qdma_sch$UP_SCH" 2>/dev/null)"
+	rate_accepted "$((up * 1000))" "$en" "$max" || {
+		logger -t eqosex "upload scheduler kept EN=$en MAX=$max instead of 1/$((up * 1000))"
+		return 1
+	}
+
+	en="$(awk 'NR == 2 { print $1 }' "$HNAT_DIR/qdma_sch$DL_SCH" 2>/dev/null)"
+	max="$(awk 'NR == 2 { print $3 }' "$HNAT_DIR/qdma_sch$DL_SCH" 2>/dev/null)"
+	rate_accepted "$((dl * 1000))" "$en" "$max" || {
+		logger -t eqosex "download scheduler kept EN=$en MAX=$max instead of 1/$((dl * 1000))"
+		return 1
+	}
+
+	return 0
+}
+
+stop_hnat_qos() {
+	[ -d "$HNAT_DIR" ] || return 0
+
+	need_qdma_layout
+	write_hnat "qos_toggle" "0"
+	reset_hnat_qdma
+}
+
+# Short-packet QoS: enable per-packet short-flow detection in the mtkhnat
+# driver so ACK/small-UDP flows are dispatched to a high-priority hardware
+# queue on any port.  On HNAT the queue id comes from skb->mark, so the
+# port/DSCP ctmark rules used by the flow-offload path are omitted here.
+apply_short_pkt() {
+	local enabled len qid qos_cur
+
+	uci -q get eqosex.config.short_pkt_priority >/dev/null 2>&1 || return 0
+	enabled="$(uci -q get eqosex.config.short_pkt_priority)"
+	[ "$enabled" = "1" ] || return 0
+
+	len="$(uci -q get eqosex.config.short_pkt_len)"
+	[ -n "$len" ] && is_uinteger "$len" || len=64
+	[ "$len" -ge 16 ] && [ "$len" -le 128 ] || len=64
+
+	# The short-packet queue must sit outside the slot range, otherwise it
+	# competes with a device rule for the same register.  Any saved qid that
+	# does not match the reserved top queue is ignored.
+	need_hnat
+	detect_qdma_layout
+	qid="$SHORT_PKT_QID"
+
+	# The short-packet qid is only written into the FOE entry when HQoS mode is
+	# active (qos_toggle != 0), so make sure it is enabled.  Default flows stay
+	# on qid 0 when no skb mark is set, so this does not disturb normal traffic.
+	if [ -e "$HNAT_DIR/qos_toggle" ]; then
+		qos_cur="$(cat "$HNAT_DIR/qos_toggle" 2>/dev/null)"
+		if [ "$qos_cur" -ne 1 ] 2>/dev/null && [ "$qos_cur" -ne 2 ] 2>/dev/null; then
+			printf '%s' 1 > "$HNAT_DIR/qos_toggle" 2>/dev/null
+		fi
+	fi
+
+	if [ -d "$HNAT_DIR" ] && [ -w "$HNAT_DIR/short_pkt_toggle" ]; then
+		printf '%s' 1 > "$HNAT_DIR/short_pkt_toggle" 2>/dev/null
+		printf '%s' "$len"  > "$HNAT_DIR/short_pkt_len" 2>/dev/null
+		printf '%s' "$qid"  > "$HNAT_DIR/short_pkt_qid" 2>/dev/null
+		# The short-packet queue is its own FIFO with no rate ceiling: ACKs
+		# must never queue behind bulk traffic, and the volume they carry
+		# sits far below the line rate anyway.
+		program_queue "$qid" "$UP_SCH" 0
+	fi
+}
+
+stop_short_pkt() {
+	[ -d "$HNAT_DIR" ] || return 0
+	[ -w "$HNAT_DIR/short_pkt_toggle" ] || return 0
+	printf '%s' 0 > "$HNAT_DIR/short_pkt_toggle" 2>/dev/null
+}
+
+# Emit an nft rule that marks matching packets to the given queue.  When a
+# port is configured both sport and dport are matched (port does not carry
+# direction semantics here), direction is handled via iifname/oifname.
+# No protocol selected but a port configured: treated as "any protocol" with
+# the port constraint kept by matching every protocol that carries ports
+# (tcp + udp) instead of silently dropping the port.
+# Optional small-packet rescue (spq = short-packet queue id, splen = short
+# flow length): emits extra rules after the general ones that re-mark this
+# rule's own small packets into spq, so ACKs do not queue behind bulk in
+# the rule's queue.  nft evaluates every rule and the last mark wins.
+emit_priority_mark() {
+	local dir="$1" proto="$2" sport="$3" dport="$4" dscp="$5" qid="$6" dev="$7"
+	local spq="$8" splen="$9"
+	local iface extra p bound
+
+	case "$dir" in
+		up) iface="iifname \"$dev\"" ;;
+		down) iface="oifname \"$dev\"" ;;
+		*) return 1 ;;
+	esac
+
+	extra=""
+	[ -n "$dscp" ] && extra="$extra ip dscp $dscp"
+
+	case "$proto" in
+		tcp|udp)
+			if [ -n "$sport" ]; then
+				"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+					$iface $proto sport "$sport" $extra meta mark set "$qid" 2>/dev/null
+			fi
+			if [ -n "$dport" ]; then
+				"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+					$iface $proto dport "$dport" $extra meta mark set "$qid" 2>/dev/null
+			fi
+			;;
+		icmp)
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				$iface meta l4proto icmp $extra meta mark set "$qid" 2>/dev/null
+			;;
+		"")
+			# Protocol unset: a configured port still carries meaning.  Keep
+			# it by matching on every protocol that has ports (tcp + udp)
+			# instead of falling into the match-all branch and dropping it.
+			if [ -n "$sport" ] || [ -n "$dport" ]; then
+				for p in tcp udp; do
+					if [ -n "$sport" ]; then
+						"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+							$iface $p sport "$sport" $extra meta mark set "$qid" 2>/dev/null
+					fi
+					if [ -n "$dport" ]; then
+						"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+							$iface $p dport "$dport" $extra meta mark set "$qid" 2>/dev/null
+					fi
+				done
+			else
+				# No port either: plain match-all rule (original behaviour)
+				"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+					$iface $extra meta mark set "$qid" 2>/dev/null
+			fi
+			;;
+		*)
+			# Unknown protocol value: match-all, ports are not applicable
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				$iface $extra meta mark set "$qid" 2>/dev/null
+			;;
+	esac
+
+	# tcp/udp with no port configured still needs a protocol-scoped rule
+	if [ "$proto" = "tcp" ] || [ "$proto" = "udp" ]; then
+		if [ -z "$sport" ] && [ -z "$dport" ]; then
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				$iface meta l4proto $proto $extra meta mark set "$qid" 2>/dev/null
+		fi
+	fi
+
+	# Small-packet rescue block (needs a port to be meaningful): same match
+	# terms as the general rules plus a wire-length bound approximating the
+	# kernel short-packet definition (pure TCP ACKs are at most 80 bytes on
+	# the wire; UDP gets the configured short-flow length plus 28 header
+	# bytes).  IPv4 only - "ip length" does not match v6.
+	if [ -n "$spq" ] && is_uinteger "$spq" && is_uinteger "$splen" &&
+	   { [ -n "$sport" ] || [ -n "$dport" ]; }; then
+		bound=$((splen + 28))
+		[ "$bound" -lt 80 ] && bound=80
+		case "$proto" in
+			tcp|udp)
+				if [ -n "$sport" ]; then
+					"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+						$iface $proto sport "$sport" $extra ip length 1-$bound \
+						meta mark set "$spq" 2>/dev/null
+				fi
+				if [ -n "$dport" ]; then
+					"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+						$iface $proto dport "$dport" $extra ip length 1-$bound \
+						meta mark set "$spq" 2>/dev/null
+				fi
+				;;
+			"")
+				for p in tcp udp; do
+					if [ -n "$sport" ]; then
+						"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+							$iface $p sport "$sport" $extra ip length 1-$bound \
+							meta mark set "$spq" 2>/dev/null
+					fi
+					if [ -n "$dport" ]; then
+						"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+							$iface $p dport "$dport" $extra ip length 1-$bound \
+							meta mark set "$spq" 2>/dev/null
+					fi
+				done
+				;;
+		esac
+	fi
+}
+
+# Apply custom priority rules: program their queues and add nft mark rules.
+# Needs the nft table, create it if the main eqosex service is disabled.
+#
+# The queue id comes from the plan, like every other rule: a priority rule
+# owns one queue per shaped direction and is counted against the pool.  The
+# old code derived a queue from the priority level alone (base + level),
+# which meant two rules on the same level shared a queue and neither the
+# planner nor the map knew about it -- the pool could hand the same queue to
+# a device rule at any time.
+apply_priority_rules() {
+	local dev="$DEV_DEFAULT"
+	local cfg enabled protocol sport dport dscp direction cur
+	local qid_up qid_dl sp_qid sp_len planned=0
+
+	need_nft
+	need_hnat
+	detect_qdma_layout
+	if ! "$NFT" list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1; then
+		nft_start "$dev" || return 1
+	fi
+
+	for cfg in $(uci -q show eqosex |
+		     sed -n 's/^eqosex\.\([^=]*\)=priority_rule$/\1/p'); do
+		enabled="$(uci -q get eqosex.$cfg.enabled)"
+		[ "$enabled" = "1" ] || continue
+
+		protocol="$(uci -q get eqosex.$cfg.protocol)"
+		sport="$(uci -q get eqosex.$cfg.sport)"
+		dport="$(uci -q get eqosex.$cfg.dport)"
+		dscp="$(uci -q get eqosex.$cfg.dscp)"
+		direction="$(uci -q get eqosex.$cfg.direction)"
+
+		# Optional small-packet rescue: re-mark this rule's own small packets
+		# into the short-packet queue so ACKs matched by the rule are not
+		# queued behind bulk traffic in the rule's queue.
+		sp_qid=""; sp_len=64
+		if [ "$(uci -q get eqosex.config.short_pkt_priority)" = "1" ] &&
+		   [ "$(uci -q get eqosex.$cfg.sp_redirect)" = "1" ] &&
+		   { [ -n "$sport" ] || [ -n "$dport" ]; }; then
+			sp_qid="$SHORT_PKT_QID"
+			sp_len="$(uci -q get eqosex.config.short_pkt_len)"
+			[ -n "$sp_len" ] && is_uinteger "$sp_len" || sp_len=64
+			[ "$sp_len" -ge 16 ] && [ "$sp_len" -le 128 ] || sp_len=64
+		fi
+
+		# HQoS mode must be on for the mark -> queue mapping to apply
+		if [ -e "$HNAT_DIR/qos_toggle" ]; then
+			cur="$(cat "$HNAT_DIR/qos_toggle" 2>/dev/null)"
+			if [ "$cur" -ne 1 ] 2>/dev/null && [ "$cur" -ne 2 ] 2>/dev/null; then
+				printf '%s' 1 > "$HNAT_DIR/qos_toggle" 2>/dev/null
+			fi
+		fi
+
+		if [ "$direction" = "up" ] || [ "$direction" = "both" ]; then
+			qid_up="$(qidmap_find "prio:$cfg" up)" || qid_up=""
+			if [ -n "$qid_up" ]; then
+				program_queue "$qid_up" "$UP_SCH" 0
+				emit_priority_mark up "$protocol" "$sport" "$dport" "$dscp" "$qid_up" "$dev" "$sp_qid" "$sp_len"
+				planned=1
+			fi
+		fi
+		if [ "$direction" = "down" ] || [ "$direction" = "both" ]; then
+			qid_dl="$(qidmap_find "prio:$cfg" dl)" || qid_dl=""
+			if [ -n "$qid_dl" ]; then
+				program_queue "$qid_dl" "$DL_SCH" 0
+				emit_priority_mark down "$protocol" "$sport" "$dport" "$dscp" "$qid_dl" "$dev" "$sp_qid" "$sp_len"
+				planned=1
+			fi
+		fi
+	done
+
+	[ "$planned" -eq 1 ] || [ -z "$(uci -q show eqosex |
+		sed -n 's/^eqosex\.\([^=]*\)=priority_rule$/\1/p')" ] || {
+		logger -t eqosex "priority rules are configured but have no queue; run 'eqosex plan' first"
+		return 1
+	}
+
+	return 0
+}
+
+enable_hnat() {
+	local fastpath bind_rate hook_state setting_cur
+
+	need_hnat
+	ensure_bridge_nf_off
+	hook_state="$(cat "$HNAT_DIR/hook_toggle")"
+	setting_cur="$(cat "$HNAT_DIR/hnat_setting" 2>/dev/null)"
+
+	# Already enabled with the same binding threshold: keep the hooks up
+	# instead of bouncing them.  The bounce costs a 3s restore-timer sleep,
+	# which pushed the whole reload past LuCI's 10s apply rollback window --
+	# every normal save then rolled back and the change silently
+	# disappeared, leaving force-apply as the only way to save (2026-11-02).
+	if [ "$hook_state" = "enabled" ] &&
+	   [ "$setting_cur" = "1 $HNAT_BIND_THRESHOLD" ]; then
+		if [ -f /etc/config/turboacc ]; then
+			fastpath="$(uci -q get turboacc.config.fastpath)"
+			bind_rate="$(uci -q get turboacc.config.fastpath_mh_bind_rate)"
+			if [ "$fastpath" != "mediatek_hnat" ] ||
+			   [ "$bind_rate" != "$HNAT_BIND_THRESHOLD" ]; then
+				uci -q set "turboacc.config.fastpath=mediatek_hnat" &&
+					uci -q set "turboacc.config.fastpath_mh_bind_rate=$HNAT_BIND_THRESHOLD" &&
+					uci -q commit turboacc ||
+					die "failed to synchronize turboacc HNAT settings"
+			fi
+		fi
+		return 0
+	fi
+
+	case "$hook_state" in
+		enabled)
+			write_hnat "hook_toggle" "0"
+			[ "$(cat "$HNAT_DIR/hook_toggle")" = "disabled" ] ||
+				die "failed to disable HNAT hooks"
+			# hnat_disable_hook() restores PPE build mode on a three-second timer.
+			sleep "$HNAT_RESTART_DELAY"
+			;;
+		disabled) ;;
+		*) die "invalid HNAT hook state: $hook_state" ;;
+	esac
+
+	write_hnat "hook_toggle" "1"
+	[ "$(cat "$HNAT_DIR/hook_toggle")" = "enabled" ] ||
+		die "failed to enable HNAT hooks"
+	write_hnat "hnat_setting" "1 $HNAT_BIND_THRESHOLD"
+
+	[ -f /etc/config/turboacc ] || return 0
+
+	fastpath="$(uci -q get turboacc.config.fastpath)"
+	bind_rate="$(uci -q get turboacc.config.fastpath_mh_bind_rate)"
+	[ "$fastpath" = "mediatek_hnat" ] &&
+		[ "$bind_rate" = "$HNAT_BIND_THRESHOLD" ] && return 0
+
+	if ! uci -q set "turboacc.config.fastpath=mediatek_hnat" ||
+	   ! uci -q set "turboacc.config.fastpath_mh_bind_rate=$HNAT_BIND_THRESHOLD" ||
+	   ! uci -q commit turboacc; then
+		die "failed to synchronize turboacc HNAT settings"
+	fi
+}
+
+# Queue allocation is persisted in QIDMAP_FILE so that a reload keeps every
+# queue id where it was.  This is not an optimisation: a flow that is already
+# offloaded carries its queue id inside the PPE entry, so moving a rule to a
+# different queue strands that entry on the old id (see foe_clear()) and
+# drops the flow out of acceleration until it re-binds.  Rewriting the *rate*
+# of a queue costs nothing -- the entry stores the id, not the rate -- which
+# is why a rule keeps its queue even when its rate changes.
+#
+# One line per (identity, direction):
+#
+#   <identity> <dir> <qid> <rate-kbit>
+#
+# identity is the selector address for a device rule ("192.168.1.10") and
+# "prio:<section>" for a custom priority rule.  A rule owns its queue: two
+# rules never share one, whatever their rates, because a queue carries a
+# single rate and a single weight and sharing would silently halve somebody's
+# budget.
+qidmap_find_file() {
+	local file="$1" identity="$2" dir="$3"
+
+	[ -f "$file" ] || return 1
+
+	awk -v s="$identity" -v d="$dir" '
+		NF >= 3 && $1 == s && $2 == d { print $3; found = 1; exit }
+		END { exit(found ? 0 : 1) }
+	' "$file"
+}
+
+qidmap_find() {
+	qidmap_find_file "$QIDMAP_FILE" "$1" "$2"
+}
+
+qidmap_used() {
+	[ -f "$QIDMAP_FILE" ] || return 0
+
+	awk 'NF >= 3 { print $3 }' "$QIDMAP_FILE" | sort -u
+}
+
+pool_capacity() {
+	echo $((POOL_QID_LAST - POOL_QID_FIRST + 1))
+}
+
+pool_reset() {
+	rm -f "$QIDMAP_FILE"
+}
+
+pool_used_count() {
+	local n
+
+	n="$(qidmap_used | wc -l)"
+	echo $((n + 0))
+}
+
+# Lowest queue id not already taken.  Callers pass the ids in use as a
+# space-padded string so the test stays a single pattern match.
+pool_first_free() {
+	local used="$1" qid
+
+	case "$used" in
+		' '*) ;;
+		*) used=" $used " ;;
+	esac
+
+	for qid in $(seq "$POOL_QID_FIRST" "$POOL_QID_LAST"); do
+		case "$used" in
+			*" $qid "*) continue ;;
+		esac
+		echo "$qid"
+		return 0
+	done
+
+	return 1
+}
+
+# Queue planner.
+#
+# Reads a full set of requirements and produces the queue assignment the
+# kernel is going to be programmed with.  It never touches the hardware: the
+# same pass runs from the GUI (to refuse a save that cannot be honoured) and
+# from the init script (to program it), so the page and the hardware cannot
+# drift apart.
+#
+# Input, one line per requirement, on stdin:
+#
+#   <identity> <dir> <rate-kbit>
+#
+# rate 0 means "a queue with no ceiling" and is used by the short-packet and
+# custom priority queues, which are separated from bulk traffic by being a
+# different FIFO rather than by being throttled.
+#
+# On success QIDMAP_FILE is replaced atomically and 0 is returned.  On failure
+# nothing is written at all and the reason goes to stderr: exit 2 when there
+# are more requirements than queues, exit 3 when the ceilings do not fit the
+# line.  A refused save therefore leaves the running configuration exactly as
+# it was -- there is no half-applied state to clean up.
+#
+# The two checks, in the order the user cares about:
+#
+#   1. queue count   one requirement, one queue.  Two clients never share a
+#                    queue, so the count is simply the number of
+#                    requirements.
+#   2. rate sum      without weights a queue rate is a hard ceiling and the
+#                    line is never oversubscribed, so the sum of the
+#                    ceilings has to fit inside the line total.  If it did
+#                    not, the scheduler would start arbitrating between
+#                    queues and every client would quietly get less than it
+#                    asked for -- which reads as a bug, not as a trade.
+plan_queues() {
+	local total_dl="$1" total_up="$2" json="$3" dry_run="$4"
+	local needs_file="$QIDMAP_FILE.needs"
+	local new_file="$QIDMAP_FILE.new"
+	local old_file="$QIDMAP_FILE.old"
+	local capacity required sum_up sum_dl limit_up=0 limit_dl=0
+	local excess_up=0 excess_dl=0 rc=0 result_file
+	local identity dir rate qid old_qid used need_rebind=0
+
+	cat > "$needs_file" || die "cannot read queue requirements"
+
+	required=$(awk '$2 == "up" || $2 == "dl" { n++ } END { print n + 0 }' "$needs_file")
+	sum_up=$(awk '$2 == "up" { s += $3 } END { print s + 0 }' "$needs_file")
+	sum_dl=$(awk '$2 == "dl" { s += $3 } END { print s + 0 }' "$needs_file")
+	capacity=$(pool_capacity)
+
+	is_uinteger "$total_up" && [ "$total_up" -gt 0 ] && limit_up=$((total_up * 1000))
+	is_uinteger "$total_dl" && [ "$total_dl" -gt 0 ] && limit_dl=$((total_dl * 1000))
+
+	[ "$limit_up" -gt 0 ] && [ "$sum_up" -gt "$limit_up" ] &&
+		excess_up=$((sum_up - limit_up))
+	[ "$limit_dl" -gt 0 ] && [ "$sum_dl" -gt "$limit_dl" ] &&
+		excess_dl=$((sum_dl - limit_dl))
+
+	if [ "$required" -gt "$capacity" ]; then
+		rc=2
+	elif [ "$excess_up" -gt 0 ] || [ "$excess_dl" -gt 0 ]; then
+		rc=3
+	fi
+
+	if [ "$rc" -ne 0 ]; then
+		rm -f "$needs_file" "$new_file"
+		[ "$json" = "1" ] && plan_error_json "$rc" "$capacity" "$required" \
+			"$sum_up" "$limit_up" "$excess_up" "$sum_dl" "$limit_dl" "$excess_dl"
+		[ "$json" = "1" ] && exit "$rc"
+		[ "$rc" -eq 2 ] && {
+			printf 'eqosex: %s rules need %s queues, %s available (short by %s)\n' \
+				"$required" "$required" "$capacity" \
+				$((required - capacity)) >&2
+			printf 'eqosex: one queue per rule; clients never share a queue\n' >&2
+			exit 2
+		}
+		[ "$excess_up" -gt 0 ] && printf 'eqosex: upload ceilings add up to %s kbit/s, line is %s kbit/s (over by %s)\n' \
+			"$sum_up" "$limit_up" "$excess_up" >&2
+		[ "$excess_dl" -gt 0 ] && printf 'eqosex: download ceilings add up to %s kbit/s, line is %s kbit/s (over by %s)\n' \
+			"$sum_dl" "$limit_dl" "$excess_dl" >&2
+		printf 'eqosex: lower the rates or remove a rule; the line is never oversubscribed\n' >&2
+		exit 3
+	fi
+
+	# Keep the map this build is replacing: an identity that already owns a
+	# queue keeps it, so editing a rate costs no re-binding.  A brand new
+	# rule takes the lowest queue that is still free.
+	#
+	# A map written by an older build keys rules by group and carries five
+	# fields, so it cannot be matched against an identity.  Drop it rather
+	# than half-matching it; the cost is one round of re-binding after the
+	# upgrade, which is what an upgrade costs anyway.
+	if [ -f "$QIDMAP_FILE" ] &&
+	   awk 'NF && NF != 4 { bad = 1 } END { exit(bad ? 0 : 1) }' "$QIDMAP_FILE"; then
+		rm -f "$QIDMAP_FILE"
+	fi
+
+	rm -f "$old_file"
+	[ -f "$QIDMAP_FILE" ] && cp "$QIDMAP_FILE" "$old_file"
+	: > "$new_file" || die "cannot write $new_file"
+
+	used=" "
+	while read -r identity dir rate; do
+		case "$dir" in
+			up|dl) ;;
+			*) continue ;;
+		esac
+		[ -n "$identity" ] || continue
+
+		qid=""
+		old_qid=""
+		old_qid="$(qidmap_find_file "$old_file" "$identity" "$dir")" || old_qid=""
+		qid="$old_qid"
+		if [ -n "$qid" ]; then
+			case "$used" in
+				*" $qid "*) qid="" ;;
+			esac
+		fi
+		if [ -z "$qid" ]; then
+			qid="$(pool_first_free "$used")" || qid=""
+		fi
+		[ -n "$qid" ] || continue
+
+		# A rule that already owned a queue and is now being moved to a
+		# different one invalidates the bindings that point at the old id.
+		# A brand new rule does not: nothing is bound to it yet, and the
+		# nft mark it gets only applies to traffic arriving afterwards.
+		if [ -n "$old_qid" ] && [ "$qid" != "$old_qid" ]; then
+			need_rebind=1
+		fi
+		used="$used$qid "
+		printf '%s %s %s %s\n' "$identity" "$dir" "$qid" "$rate" >> "$new_file"
+	done < "$needs_file"
+
+	# A dry run answers "would this be accepted, and what would it look
+	# like" without touching anything, so the GUI can refuse a save before
+	# it is committed.
+	if [ "$dry_run" = "1" ]; then
+		result_file="$new_file"
+	else
+		mv "$new_file" "$QIDMAP_FILE" || die "cannot install $QIDMAP_FILE"
+		result_file="$QIDMAP_FILE"
+
+		# Tell add_rule() whether the bindings have to be rebuilt.  A plain
+		# rate edit leaves every binding alone; only a rule that moves to a
+		# different queue costs a re-bind.
+		if [ "$need_rebind" -eq 1 ]; then
+			: > "$REBIND_FILE"
+		else
+			rm -f "$REBIND_FILE"
+		fi
+	fi
+	rm -f "$needs_file" "$old_file"
+
+	if [ "$json" = "1" ]; then
+		plan_ok_json "$capacity" "$required" "$result_file"
+	else
+		printf 'queues: %s of %s used\n' "$required" "$capacity"
+		printf 'upload ceilings: %s kbit/s%s\n' "$sum_up" \
+			"$([ "$limit_up" -gt 0 ] && echo " of $limit_up")"
+		printf 'download ceilings: %s kbit/s%s\n' "$sum_dl" \
+			"$([ "$limit_dl" -gt 0 ] && echo " of $limit_dl")"
+		awk '{ printf "  %-8s %s -> qid%s (%s kbit/s)\n", $2, $1, $3, ($4 == 0 ? "no ceiling" : $4) }' \
+			"$result_file"
+	fi
+
+	[ "$dry_run" = "1" ] && rm -f "$new_file"
+
+	return 0
+}
+
+plan_ok_json() {
+	local capacity="$1" required="$2" file="$3"
+
+	printf '{"ok":true,"capacity":%s,"required":%s,"queues":[' \
+		"$capacity" "$required"
+	awk 'BEGIN { first = 1 }
+		{
+			if (!first) printf ","
+			printf "{\"id\":\"%s\",\"dir\":\"%s\",\"qid\":%s,\"rate\":%s}", $1, $2, $3, $4
+			first = 0
+		}' "$file"
+	printf ']}\n'
+}
+
+plan_error_json() {
+	local rc="$1" capacity="$2" required="$3"
+	local sum_up="$4" limit_up="$5" excess_up="$6"
+	local sum_dl="$7" limit_dl="$8" excess_dl="$9"
+	local sep
+
+	printf '{"ok":false,"exit":%s,"capacity":%s,"required":%s,"errors":[' \
+		"$rc" "$capacity" "$required"
+	sep=""
+	if [ "$rc" -eq 2 ]; then
+		printf '%s{"code":"queue_count","required":%s,"available":%s,"shortfall":%s}' \
+			"$sep" "$required" "$capacity" $((required - capacity))
+		sep=","
+	fi
+	if [ "$excess_up" -gt 0 ]; then
+		printf '%s{"code":"rate_sum","dir":"up","required_kbit":%s,"limit_kbit":%s,"excess_kbit":%s}' \
+			"$sep" "$sum_up" "$limit_up" "$excess_up"
+		sep=","
+	fi
+	if [ "$excess_dl" -gt 0 ]; then
+		printf '%s{"code":"rate_sum","dir":"dl","required_kbit":%s,"limit_kbit":%s,"excess_kbit":%s}' \
+			"$sep" "$sum_dl" "$limit_dl" "$excess_dl"
+	fi
+	printf ']}\n'
+}
+
+# Changing the queue id of a flow that is already bound has no effect: the
+# hardware forwards those packets itself and never runs the nft
+# classification again.  Writing a different value to short_pkt_qid and the
+# original one straight back makes the driver drop every binding, because
+# DEFINE_HNAT_INT_DEBUGFS calls foe_clear_all_bind_entries() whenever the
+# value actually changes.
+#
+# This costs nothing while short-packet priority is disabled, which is the
+# default: the driver does not read short_pkt_qid in that state.  With
+# short-packet priority enabled a few small flows may land on the wrong
+# queue for the microseconds between the two writes, which is acceptable
+# compared to leaving every bound flow on a stale queue id.
+foe_clear() {
+	local cur next
+
+	[ -w "$HNAT_DIR/short_pkt_qid" ] || return 0
+
+	cur="$(cat "$HNAT_DIR/short_pkt_qid" 2>/dev/null)"
+	case "$cur" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+
+	[ "$cur" -eq 0 ] && next=1 || next=0
+
+	printf '%s' "$next" > "$HNAT_DIR/short_pkt_qid" 2>/dev/null
+	printf '%s' "$cur" > "$HNAT_DIR/short_pkt_qid" 2>/dev/null
+	return 0
+}
+
+# Program one hardware queue: scheduler placement plus an optional ceiling.
+#
+# A queue belongs to exactly one rule, so this is a plain write instead of
+# the read-modify-write the old shared pool needed.  That difference matters:
+# the old version took max(existing, new) for the weight, so a queue reused
+# by a later rule kept the highest weight it had ever been given.  The weight
+# is now a fixed constant (WEIGHT_FIXED) and the min-rate fields are always
+# zero, because no rule asks for a guaranteed floor.
+#
+# rate 0 means "no ceiling": the short-packet and custom priority queues are
+# kept apart from bulk traffic by being separate FIFOs, not by being
+# throttled.
+program_queue() {
+	local qid="$1"
+	local sch="$2"
+	local rate="$3"
+
+	is_uinteger "$qid" && [ "$qid" -gt 0 ] || die "invalid queue id: $qid"
+	is_uinteger "$rate" || die "rate must be an integer"
+
+	if [ "$rate" -eq 0 ]; then
+		write_hnat "qdma_txq$qid" "$sch 0 0 0 0 $WEIGHT_FIXED 1"
+	else
+		write_hnat "qdma_txq$qid" "$sch 0 0 1 $rate $WEIGHT_FIXED 1"
+	fi
+}
+
+# What a queue actually holds right now, as "<scheduler> <max_en> <max_rate>".
+queue_actual() {
+	awk '/^scheduler:/ { s = $2 }
+	     $1 == "max" { e = $2; r = $3 }
+	     END { printf "%d %d %d\n", s + 0, e + 0, r + 0 }' \
+		"$HNAT_DIR/qdma_txq$1" 2>/dev/null
+}
+
+# Write a queue and read it back.
+#
+# A write returning success does not mean the queue kept the value.  The
+# MediaTek HQoS path re-initialises queues asynchronously once the mode is
+# switched on, so a write that lands inside that window is accepted and then
+# quietly overwritten -- the register ends up at its reset value with the
+# ceiling disabled, which looks exactly like "shaping is configured but
+# nothing is limited".  Observed on a cold boot: the upload queue came back
+# with scheduler 0 and no ceiling while the download queue next to it kept
+# its settings, because only the first write raced the initialisation.
+#
+# Reading the value back turns that into a retry instead of a silent loss.
+program_queue_verified() {
+	local qid="$1"
+	local sch="$2"
+	local rate="$3"
+	local want actual tries=0 a_sch a_en a_rate
+
+	if [ "$rate" -eq 0 ]; then
+		want="$sch 0 0"
+	else
+		want="$sch 1 $rate"
+	fi
+
+	# The scheduler quantizes rates (999000 kbit/s is kept as 990000), so a
+	# non-zero kept rate is accepted within 2% of the request.  An exact
+	# compare turned every non-round device rate into a failed verification.
+	queue_accepted() {
+		a_sch=${1%% *}
+		a_rate=${1##* }
+		[ "$a_sch" = "$sch" ] || return 1
+		if [ "$rate" -eq 0 ]; then
+			[ "$a_rate" -eq 0 ]
+		else
+			[ "$a_rate" -le "$rate" ] && [ "$a_rate" -ge $((rate * 98 / 100)) ]
+		fi
+	}
+
+	while :; do
+		program_queue "$qid" "$sch" "$rate" || return 1
+		actual="$(queue_actual "$qid")"
+		queue_accepted "$actual" && return 0
+
+		tries=$((tries + 1))
+		[ "$tries" -lt "$PROGRAM_TRIES" ] || break
+		sleep 1
+	done
+
+	logger -t eqosex \
+		"queue $qid kept $actual instead of $want; shaping on it is not in effect"
+	return 1
+}
+
+# Re-assert every queue the plan owns, at the very end of the boot sequence.
+#
+# Deliberately last: the HNAT hooks, the HQoS mode switch and the per-port
+# setup all run before this, so by now nothing is still initialising and the
+# values written here are the ones the hardware keeps.  Following the plan
+# rather than re-deciding is the point -- queue ids come from QIDMAP_FILE, so
+# this replays a decision that was already made and cannot disagree with what
+# the rules installed.
+program_all() {
+	local identity dir qid rate failed=0 total=0 sch
+
+	# Re-assert on every hotplug-driven reprogram too: a module load or any
+	# other actor can flip the sysctl after boot, and the qid that reaches
+	# HNAT only stays meaningful while this stays 0.
+	ensure_bridge_nf_off
+
+	[ -f "$QIDMAP_FILE" ] || return 0
+
+	while read -r identity dir qid rate; do
+		[ -n "$qid" ] || continue
+
+		case "$dir" in
+			up) sch="$UP_SCH" ;;
+			dl) sch="$DL_SCH" ;;
+			*) continue ;;
+		esac
+
+		total=$((total + 1))
+		program_queue_verified "$qid" "$sch" "$rate" || failed=$((failed + 1))
+	done < "$QIDMAP_FILE"
+
+	if [ "$failed" -gt 0 ]; then
+		logger -t eqosex \
+			"$failed of $total queues did not accept their settings"
+		return 1
+	fi
+
+	return 0
+}
+
+nft_mark_rule() {
+	local dir="$1"
+	local family="$2"
+	local value="$3"
+	local qid="$4"
+	local addr
+
+	[ -n "$value" ] || return 0
+
+	case "$dir" in
+		up) addr="saddr" ;;
+		dl) addr="daddr" ;;
+		*)
+			return 1
+			;;
+	esac
+
+	case "$family" in
+		ip)
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				ip "$addr" "$value" \
+				meta mark '&' "$HNAT_EXCEPTION_BIT" == 0 \
+				meta mark set "$qid"
+			;;
+		ip6)
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				ip6 "$addr" "$value" \
+				meta mark '&' "$HNAT_EXCEPTION_BIT" == 0 \
+				meta mark set "$qid"
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+# Per-client concurrency limit.
+#
+# nf_conncount buckets its counters on the original source address of the
+# conntrack, so one rule matching the LAN source already covers every
+# connection the client opens -- the download half belongs to the same
+# conntrack and lands in the same bucket.  Connections initiated from the
+# outside are the exception and are not counted, which is what we want:
+# the budget protects the FOE table from a single LAN device.
+#
+# ct state new keeps established flows untouched and only refuses new ones
+# once the client sits above its budget, so a burst cannot blackhole an
+# already running download.
+#
+# An add failure is not fatal: the kernel may lack kmod-nft-connlimit (the
+# expression is a separate module).  Note it and carry on so that shaping
+# still works on a firmware built without it.
+nft_connlimit_rule() {
+	local family="$1"
+	local value="$2"
+	local limit="$3"
+
+	[ -n "$value" ] || return 0
+	[ -n "$limit" ] || return 0
+	[ "$limit" -gt 0 ] 2>/dev/null || return 0
+
+	case "$family" in
+		ip)
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				ip saddr "$value" ct state new \
+				ct count over "$limit" drop && return 0
+			;;
+		ip6)
+			"$NFT" add rule "$TABLE_FAMILY" "$TABLE_NAME" "$CHAIN_NAME" \
+				ip6 saddr "$value" ct state new \
+				ct count over "$limit" drop && return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+
+	logger -t eqosex "connection limit for $value not applied: ct count unavailable (install kmod-nft-connlimit)"
+	CONNLIMIT_MISSING=1
+	return 0
+}
+
+# Raise the global conntrack table size when asked to.  The per-client
+# limits are the real protection; this only keeps the table itself from
+# filling up under many clients.
+apply_conntrack_max() {
+	local max
+
+	max="$(uci -q get eqosex.config.conntrack_max)"
+	[ -n "$max" ] || return 0
+	is_uinteger "$max" || return 0
+	[ "$max" -gt 0 ] || return 0
+	[ -w /proc/sys/net/netfilter/nf_conntrack_max ] || return 0
+
+	printf '%s' "$max" > /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null
+}
+
+add_rule() {
+	local slot="$1"
+	local dl="$2"
+	local up="$3"
+	local ip4="$4"
+	local ip6="$5"
+	local total_dl="$6"
+	local total_up="$7"
+	local connlimit="$8"
+	local group="$9"
+	local up_qid dl_qid selector_count selector shaped=0
+
+	# The first argument is a rule label only.  It used to be the hardware
+	# queue id, which is why it is a number and why it used to be checked;
+	# queues are handed out by the planner now, so the value is accepted,
+	# ignored, and may be empty.
+	[ -n "$slot" ] || slot=0
+
+	is_uinteger "$slot" || die "the rule label must be an integer"
+	is_uinteger "$dl" || die "download rate must be an integer"
+	is_uinteger "$up" || die "upload rate must be an integer"
+
+	[ "$dl" -le "$QDMA_RATE_MAX" ] && [ "$up" -le "$QDMA_RATE_MAX" ] ||
+		die "device rate must not exceed $QDMA_RATE_MAX kbit/s"
+	[ -n "$ip4" ] && valid_ipv4 "$ip4" || [ -z "$ip4" ] ||
+		die "invalid IPv4 selector"
+	[ -n "$ip6" ] && valid_ipv6 "$ip6" || [ -z "$ip6" ] ||
+		die "invalid IPv6 selector"
+
+	selector_count=0
+	[ -z "$ip4" ] || selector_count=$((selector_count + 1))
+	[ -z "$ip6" ] || selector_count=$((selector_count + 1))
+	[ "$selector_count" -eq 1 ] ||
+		die "exactly one selector is required: IPv4 or IPv6"
+
+	connlimit="${connlimit:-0}"
+	is_uinteger "$connlimit" || [ "$connlimit" = "0" ] ||
+		die "connection limit must be a non-negative integer"
+
+	if [ "$dl" -ne 0 ] || [ "$up" -ne 0 ]; then
+		shaped=1
+	fi
+
+	# A rule with no rate but a connection limit is still meaningful: it
+	# caps concurrency without reserving a hardware queue.
+	[ "$shaped" -eq 1 ] || [ "$connlimit" -gt 0 ] || return 0
+
+	need_nft
+	need_qdma_layout
+
+	# Connection limits are independent of shaping: a client can be capped
+	# on concurrency only, which costs no hardware queue at all.  Install
+	# the rule before the mark rules so the chain stays readable.
+	if [ -n "$connlimit" ] && [ "$connlimit" -gt 0 ] 2>/dev/null; then
+		nft_connlimit_rule ip "$ip4" "$connlimit" || return 1
+		nft_connlimit_rule ip6 "$ip6" "$connlimit" || return 1
+	fi
+
+	# This command only executes a plan, it never makes one.  The queue id
+	# comes from QIDMAP_FILE, which plan_queues() filled after checking that
+	# the whole configuration fits the hardware.  Refusing to invent an id
+	# here is what keeps the page and the hardware in agreement: there is
+	# exactly one place that decides who gets which queue.
+	selector="$ip4$ip6"
+
+	if [ "$up" -ne 0 ]; then
+		up_qid=""
+		up_qid="$(qidmap_find "$selector" up)" ||
+			die "no queue planned for $selector up; run 'eqosex plan' first"
+		program_queue "$up_qid" "$UP_SCH" "$up" || return 1
+		nft_mark_rule up ip "$ip4" "$up_qid" || return 1
+		nft_mark_rule up ip6 "$ip6" "$up_qid" || return 1
+	fi
+
+	if [ "$dl" -ne 0 ]; then
+		dl_qid=""
+		dl_qid="$(qidmap_find "$selector" dl)" ||
+			die "no queue planned for $selector dl; run 'eqosex plan' first"
+		program_queue "$dl_qid" "$DL_SCH" "$dl" || return 1
+		nft_mark_rule dl ip "$ip4" "$dl_qid" || return 1
+		nft_mark_rule dl ip6 "$ip6" "$dl_qid" || return 1
+	fi
+
+	# Dropping the PPE bindings costs every live connection a re-bind, so
+	# only do it when a queue id actually moved.  Editing a rate rewrites
+	# the shaper register and leaves the bindings alone; plan_queues()
+	# raises the flag when it had to hand a rule a different queue.
+	if [ "$shaped" -eq 1 ] && [ -f "$REBIND_FILE" ]; then
+		foe_clear
+		rm -f "$REBIND_FILE"
+	fi
+}
+
+add_inferred_rule() {
+	local slot="$1"
+	local dl="$2"
+	local up="$3"
+	local selector="$4"
+	local total_dl="$5"
+	local total_up="$6"
+	local connlimit="$7"
+	local group="$8"
+	local ip4 ip6
+
+	[ -n "$selector" ] || die "selector is required"
+
+	if valid_ipv4 "$selector"; then
+		ip4="$selector"
+	elif valid_ipv6 "$selector"; then
+		ip6="$selector"
+	else
+		die "selector must be an IPv4 or IPv6 address"
+	fi
+
+	add_rule "$slot" "$dl" "$up" "$ip4" "$ip6" "$total_dl" "$total_up" "$connlimit" "$group"
+}
+
+start_all() {
+	local dl="$1"
+	local up="$2"
+	local dev="$DEV_DEFAULT"
+
+	is_uinteger "$dl" || die "download rate must be an integer"
+	is_uinteger "$up" || die "upload rate must be an integer"
+	[ "$dl" -gt 0 ] || die "download rate must be greater than 0"
+	[ "$up" -gt 0 ] || die "upload rate must be greater than 0"
+	[ "$dl" -le "$TOTAL_RATE_MAX" ] && [ "$up" -le "$TOTAL_RATE_MAX" ] ||
+		die "total rate must not exceed $TOTAL_RATE_MAX Mbit/s"
+
+	need_qdma_layout
+	ensure_bridge_nf_off
+
+	# The queue map is deliberately kept across a start.  The scheduler is
+	# reset, but the queue ids the rules already own stay valid, so a reload
+	# does not have to re-bind every connection.
+	#
+	# The rebind flag must NOT be cleared here: the caller plans before it
+	# starts (see init.d/eqosex), so by the time this runs the flag already
+	# records whether a queue id moved.  Clearing it here would leave the
+	# stale bindings in place after a renumbering, and those point at the
+	# old queue.
+
+	apply_conntrack_max
+	stop_qos
+	nft_stop
+	if ! start_hnat_qos "$dl" "$up"; then
+		stop_hnat_qos
+		die "the QDMA scheduler did not accept the line rate; nothing is shaped"
+	fi
+	nft_start "$dev" || die "failed to configure nftables"
+}
+
+stop_all() {
+	stop_qos
+	nft_stop
+	stop_hnat_qos
+	stop_short_pkt
+	pool_reset
+	rm -f "$REBIND_FILE"
+}
+
+# `plan` reads requirements from stdin and either writes the queue map or
+# refuses.  It is the only place that decides which rule owns which queue, so
+# a caller that wants to know whether a configuration is acceptable runs this
+# and reads the answer -- it does not re-derive the rules itself.
+# ---- rule -> requirement mapping -----------------------------------------
+#
+# The planner consumes one line per shaped direction:
+#
+#   <identity> <up|dl> <rate-kbit>
+#
+# Two sources produce those lines: the uci file at boot, and the web page
+# before it saves (it hands over the values still sitting in the form, because
+# a check that read the committed file would validate the configuration being
+# replaced instead of the one being saved).  Only the functions below decide
+# what a rule contributes, so the two sources cannot drift apart.
+
+# uci spells a boolean several ways once it has been through config_get_bool
+# and once it has not.
+uci_true() {
+	case "$1" in
+		1|on|true|yes|enabled) return 0 ;;
+	esac
+	return 1
+}
+
+# One device rule -> zero, one or two requirement lines.
+#   <enabled> <ip4> <ip6> <download-kbit> <upload-kbit>
+need_from_device() {
+	local ip4="$2" ip6="$3" download="$4" upload="$5" selector
+
+	uci_true "$1" || return 0
+
+	selector="$ip4$ip6"
+	[ -n "$selector" ] || return 0
+
+	is_uinteger "$upload" && [ "$upload" -gt 0 ] && echo "$selector up $upload"
+	is_uinteger "$download" && [ "$download" -gt 0 ] && echo "$selector dl $download"
+	return 0
+}
+
+# One custom priority rule -> zero, one or two requirement lines.  It carries
+# no rate: all it asks for is a queue of its own on each direction it covers.
+#   <enabled> <section> <up|down|both>
+need_from_priority() {
+	local section="$2" direction="$3"
+
+	uci_true "$1" || return 0
+
+	case "$direction" in
+		up) echo "prio:$section up 0" ;;
+		down) echo "prio:$section dl 0" ;;
+		both)
+			echo "prio:$section up 0"
+			echo "prio:$section dl 0"
+			;;
+	esac
+	return 0
+}
+
+# Flatten a uci file into "<section>\t<key>\t<value>", plus one
+# "<section>\t__type\t<type>" line per section.  This is not a general uci
+# parser: every value this package stores is a bare word or a single-quoted
+# scalar, so stripping one quote at each end is enough, and it cannot
+# disagree with uci about the values that decide an allocation.
+uci_flatten() {
+	awk -v OFS='\t' -v sq="'" -v dq='"' '
+		function unq(s) {
+			if (substr(s, 1, 1) == sq || substr(s, 1, 1) == dq)
+				s = substr(s, 2)
+			if (substr(s, length(s), 1) == sq || substr(s, length(s), 1) == dq)
+				s = substr(s, 1, length(s) - 1)
+			return s
+		}
+		$1 == "config" {
+			type = unq($2)
+			sec = unq($3)
+			# An unnamed section has to come out with the same name uci
+			# uses for it, i.e. "@type[n]" counting unnamed sections of
+			# that type from zero.  The planner and apply_priority_rules
+			# both key on this name, so inventing a third form here (as
+			# "type_n" did) leaves the planner allocating a queue that
+			# the rule can never find, and the rule then emits no mark.
+			if (sec == "") {
+				sec = "@" type "[" (anon[type] + 0) "]"
+				anon[type]++
+			}
+			print sec, "__type", type
+			next
+		}
+		$1 == "option" && sec != "" {
+			print sec, unq($2), unq($3)
+			next
+		}
+	' "$1"
+}
+
+cfg_get() {
+	awk -F'\t' -v s="$1" -v k="$2" '$1 == s && $2 == k { print $3; exit }' "$CFG_CACHE"
+}
+
+cfg_sections() {
+	awk -F'\t' -v t="$1" '$2 == "__type" && $3 == t { print $1 }' "$CFG_CACHE"
+}
+
+# Requirement lines from an already flattened config in $CFG_CACHE.  The
+# defaults match what /etc/init.d/eqosex has always used: a device rule is
+# on unless it is switched off, a priority rule is off unless it is switched
+# on, and a missing direction means upload.
+needs_from_config() {
+	local sec enabled direction
+
+	for sec in $(cfg_sections device); do
+		enabled="$(cfg_get "$sec" enabled)"
+		[ -n "$enabled" ] || enabled=1
+		need_from_device "$enabled" "$(cfg_get "$sec" ip)" "$(cfg_get "$sec" ip6)" \
+			"$(cfg_get "$sec" download)" "$(cfg_get "$sec" upload)"
+	done
+
+	for sec in $(cfg_sections priority_rule); do
+		enabled="$(cfg_get "$sec" enabled)"
+		[ -n "$enabled" ] || enabled=0
+		direction="$(cfg_get "$sec" direction)"
+		[ -n "$direction" ] || direction=up
+		need_from_priority "$enabled" "$sec" "$direction"
+	done
+
+	return 0
+}
+
+# Requirement lines from the pending form values, one rule per line.  Fields
+# are comma separated rather than space separated because the address pair can
+# leave a hole (an IPv6-only rule has no ip4), and a hole would shift every
+# field after it if the line were split on whitespace:
+#
+#   dev,<enabled>,<ip4>,<ip6>,<download-kbit>,<upload-kbit>
+#   prio,<enabled>,<section>,<up|down|both>
+needs_from_spec() {
+	local kind a b c d e
+
+	while IFS=',' read -r kind a b c d e; do
+		case "$kind" in
+			dev) need_from_device "$a" "$b" "$c" "$d" "$e" ;;
+			prio) need_from_priority "$a" "$b" "$c" ;;
+		esac
+	done
+
+	return 0
+}
+
+plan_cli() {
+	local total_dl="" total_up="" json=0 dry_run=0
+	local config_file="" spec="" needs_in="" rc=0
+
+	while [ $# -gt 0 ]; do
+		case "$1" in
+			--total-dl) total_dl="$2"; shift 2 ;;
+			--total-up) total_up="$2"; shift 2 ;;
+			--json) json=1; shift ;;
+			--dry-run) dry_run=1; shift ;;
+			--config) config_file="$2"; shift 2 ;;
+			--spec) spec="$2"; shift 2 ;;
+			*) die "unknown plan option: $1" ;;
+		esac
+	done
+
+	# Turn whichever source was given into the requirement lines the rest of
+	# the planner works on.  A config file also supplies the two totals, so a
+	# boot-time check needs no arguments at all.
+	if [ -n "$config_file" ]; then
+		CFG_CACHE="$EQOSEX_RUNDIR/eqosex.cache"
+		uci_flatten "$config_file" > "$CFG_CACHE" ||
+			die "cannot read $config_file"
+		[ -n "$total_dl" ] || total_dl="$(cfg_get config download)"
+		[ -n "$total_up" ] || total_up="$(cfg_get config upload)"
+		needs_in="$EQOSEX_RUNDIR/eqosex.needs"
+		needs_from_config > "$needs_in"
+		rm -f "$CFG_CACHE"
+
+	elif [ -n "$spec" ]; then
+		needs_in="$EQOSEX_RUNDIR/eqosex.needs"
+		printf '%s\n' "$spec" | needs_from_spec > "$needs_in"
+	fi
+
+	# Offline planning (unit tests, or a preview before the driver is up)
+	# takes the queue count from EQOSEX_QCOUNT; on a router the driver is
+	# asked what it actually exposes.
+	if [ -n "${EQOSEX_QCOUNT:-}" ]; then
+		compute_layout "$EQOSEX_QCOUNT"
+	else
+		need_hnat
+		detect_qdma_layout
+	fi
+
+	if [ -n "$needs_in" ]; then
+		# plan_queues() exits on a refusal, so the scratch file it reads is
+		# cleared before it runs rather than after.
+		{
+			plan_queues "$total_dl" "$total_up" "$json" "$dry_run" < "$needs_in"
+		}
+		rc=$?
+		rm -f "$needs_in"
+		return "$rc"
+	fi
+
+	plan_queues "$total_dl" "$total_up" "$json" "$dry_run"
+}
+
+# Refuse a configuration before it is written.  This is plan with the two
+# flags that make it harmless, and the web page calls exactly this: a save
+# that cannot be applied must not reach /etc/config, because by the time the
+# boot sequence rejects it the old rules are already torn down and the user is
+# left with no shaping at all -- far worse than being told which row to drop.
+check_cli() {
+	plan_cli --dry-run --json "$@"
+}
+
+usage() {
+	cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  start <download_mbit> <upload_mbit>
+  plan [--total-dl <mbit>] [--total-up <mbit>] [--json] [--config <file>] [--spec <lines>]
+  check [--config <file>] [--spec <lines>] [--total-dl <mbit>] [--total-up <mbit>]
+  add <slot> <download_kbit> <upload_kbit> <ipv4|ipv6> [total_down_mbit] [total_up_mbit] [connlimit]
+  enable
+  shortpkt
+  shortpkt-stop
+  priority
+  stop
+
+A configuration is applied in three steps: start once to set up the
+scheduler, plan to decide which rule owns which queue, then one add per rule
+to program it.  add never invents a queue id -- it only executes what plan
+produced -- so there is exactly one place that decides who gets which queue,
+and the page cannot disagree with the hardware.
+
+plan reads one requirement per line from stdin:
+
+  <identity> <dir> <rate_kbit>
+
+dir is "up" or "dl", and rate 0 means "no ceiling".  It prints the
+assignment and exit code 0, or refuses with a diagnostic and exit code 2
+(more rules than queues) or 3 (the ceilings do not fit the line).  --json
+prints the same thing in a form the web UI can render directly.  Nothing is
+written when it refuses, so a rejected save leaves the running
+configuration exactly as it was.
+
+--config <file> takes the requirements from a uci file instead of stdin and
+also reads the two line totals from it, which is how the boot sequence uses
+it.  --spec <lines> takes them from the web page before it saves, one rule
+per line, comma separated because the address pair can leave a hole:
+
+  dev,<enabled>,<ip4>,<ip6>,<download_kbit>,<upload_kbit>
+  prio,<enabled>,<section>,<up|down|both>
+
+check is plan --dry-run --json.  It answers "would this be accepted" without
+writing anything, and the page calls exactly it: a configuration that cannot
+be applied is refused before it is committed, so the running rules survive a
+mistake instead of being torn down by a failed start.
+
+Every rule owns its queue; two clients never share one.  A queue carries a
+single rate and a single weight, so sharing would give both clients a single
+budget -- each ending up with half of what it asked for -- and that looks
+exactly like a bug.  The pool is a hard ceiling: qid0 stays the default
+queue for unclassified traffic, the top queue is reserved for the
+short-packet priority queue while that feature is on, and everything between
+belongs to the rules.  On a 16-queue MT7981/MT7986 that is 15 queues with
+short-packet priority off or 14 with it on, so 7 bidirectional clients or 14
+clients shaped in a single direction.
+
+Weights are not configurable.  Weight only decides a share while the
+scheduler's total is saturated, and this build never sells more than the
+line can carry: each rule is shaped to its own ceiling and the ceilings must
+add up to no more than the total, so nothing is ever contested.  A sum that
+does not fit is refused rather than quietly oversubscribed, because every
+client would then get less than it asked for with no way to tell why.
+
+A rule keeps its queue id across reloads, and editing a rate rewrites the
+shaper register without touching the PPE bindings, so live connections are
+not disturbed.  Only a rule that actually has to move to a different queue
+costs a re-bind.
+
+connlimit caps how many connections one client may hold at the same time.
+It counts conntrack entries whose original source is that client, so it
+covers both directions of every flow it opens, and it costs no hardware
+queue.  Established flows are left alone: only new connections are refused
+once the budget is reached.  A value of 0 (the default) means unlimited.
+The limit needs kmod-nft-connlimit; without it the rule is skipped with a
+warning and shaping keeps working.
+EOF
+}
+
+case "$1" in
+	start)
+		shift
+		start_all "$@"
+		;;
+	stop)
+		shift
+		stop_all "$@"
+		;;
+	plan)
+		shift
+		plan_cli "$@"
+		;;
+	check)
+		shift
+		check_cli "$@"
+		;;
+	add)
+		shift
+		add_inferred_rule "$@"
+		;;
+	enable)
+		shift
+		enable_hnat "$@"
+		;;
+	program)
+		shift
+		program_all "$@"
+		;;
+	shortpkt)
+		shift
+		apply_short_pkt "$@"
+		;;
+	shortpkt-stop)
+		shift
+		stop_short_pkt "$@"
+		;;
+	priority)
+		shift
+		apply_priority_rules "$@"
+		;;
+	*)
+		usage
+		exit 1
+		;;
+esac

@@ -1,0 +1,17 @@
+#!/bin/sh
+[ "$ACTION" = "ifup" ] || exit 0
+
+case "$INTERFACE" in
+	lan)
+		/etc/init.d/eqosex start
+		;;
+	wan|wan6)
+		# The driver rewrites a port queue through mtk_set_queue_speed()
+		# every time a link changes speed, so whatever we programmed there
+		# is gone after the line comes back up.  Re-assert the queue
+		# registers and let the readback confirm them; the nft marking and
+		# the queue map are untouched by a link flap, so a full restart
+		# would only cost the connections.
+		[ -x /usr/sbin/eqosex ] && /usr/sbin/eqosex program
+		;;
+esac

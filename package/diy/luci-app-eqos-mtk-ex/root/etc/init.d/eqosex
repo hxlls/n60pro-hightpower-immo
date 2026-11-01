@@ -1,0 +1,314 @@
+#!/bin/sh /etc/rc.common
+# Copyright (C) 2006 OpenWrt.org
+
+START=51
+USE_PROCD=1
+
+QDMA_RATE_MAX=1000000
+TOTAL_RATE_MAX=1000
+
+is_uinteger() {
+	case "$1" in
+		''|*[!0-9]*|0[0-9]*) return 1 ;;
+	esac
+
+	return 0
+}
+
+validate_device() {
+	local cfg="$1"
+	local enabled
+
+	config_get_bool enabled "$cfg" enabled 1
+	[ "$enabled" -eq 1 ] || return 0
+
+	local ip ip6 selector selector_count selector_key
+	local download upload connlimit
+	config_get ip "$cfg" ip
+	config_get ip6 "$cfg" ip6
+	config_get download "$cfg" download 0
+	config_get upload "$cfg" upload 0
+	config_get connlimit "$cfg" connlimit 0
+	config_get selector "$cfg" selector
+
+	connlimit="${connlimit:-0}"
+	if [ "$connlimit" != "0" ] && ! is_uinteger "$connlimit"; then
+		echo "eqosex: $cfg connlimit must be a non-negative integer" >&2
+		CONFIG_ERROR=1
+		return 0
+	fi
+
+	if [ "$connlimit" -gt 65535 ] 2>/dev/null; then
+		echo "eqosex: $cfg connlimit must not exceed 65535" >&2
+		CONFIG_ERROR=1
+		return 0
+	fi
+
+	# There is deliberately no queue-number check here.  The "queue" option
+	# is a leftover label from the layout that made the operator pick a
+	# hardware queue by hand; queues are now handed out by the planner, so
+	# requiring the number to be present and unique would force the user to
+	# invent a distinct value per row for no benefit at all -- and would
+	# reject a perfectly valid configuration that simply reused a label.
+
+	if ! is_uinteger "$download" || ! is_uinteger "$upload"; then
+		echo "eqosex: $cfg download and upload rates must be integers" >&2
+		CONFIG_ERROR=1
+		return 0
+	fi
+
+	if [ "$download" -gt "$QDMA_RATE_MAX" ] || [ "$upload" -gt "$QDMA_RATE_MAX" ]; then
+		echo "eqosex: $cfg download and upload rates must not exceed $QDMA_RATE_MAX kbit/s" >&2
+		CONFIG_ERROR=1
+		return 0
+	fi
+
+	selector_count=0
+	[ -z "$ip" ] || selector_count=$((selector_count + 1))
+	[ -z "$ip6" ] || selector_count=$((selector_count + 1))
+
+	if [ "$selector_count" -ne 1 ]; then
+		echo "eqosex: $cfg must set exactly one match field: ip or ip6" >&2
+		CONFIG_ERROR=1
+		return 0
+	fi
+
+	case "$selector" in
+		''|ip|ip6) ;;
+		*)
+			echo "eqosex: $cfg selector must be ip or ip6" >&2
+			CONFIG_ERROR=1
+			return 0
+			;;
+	esac
+
+	case "$selector" in
+		ip)
+			if [ -z "$ip" ]; then
+				echo "eqosex: $cfg selector does not match configured field" >&2
+				CONFIG_ERROR=1
+				return 0
+			fi
+			;;
+		ip6)
+			if [ -z "$ip6" ]; then
+				echo "eqosex: $cfg selector does not match configured field" >&2
+				CONFIG_ERROR=1
+				return 0
+			fi
+			;;
+	esac
+
+	if [ -n "$ip" ]; then
+		selector_key="ip:$ip"
+	else
+		selector_key="ip6:$ip6"
+	fi
+
+	case "$USED_SELECTORS" in
+		*" $selector_key "*)
+			echo "eqosex: selector $selector_key is used by more than one rule" >&2
+			CONFIG_ERROR=1
+			return 0
+			;;
+	esac
+	USED_SELECTORS="${USED_SELECTORS}${selector_key} "
+}
+
+parse_device() {
+	local cfg="$1"
+	local enabled
+
+	config_get_bool enabled "$cfg" enabled 1
+	[ "$enabled" -eq 1 ] || return 0
+
+	local ip ip6 address download upload queue total_download total_upload connlimit
+	config_get ip "$cfg" ip
+	config_get ip6 "$cfg" ip6
+	config_get download "$cfg" download 0
+	config_get upload "$cfg" upload 0
+	config_get connlimit "$cfg" connlimit 0
+	config_get queue "$cfg" queue
+	config_get total_download config download
+	config_get total_upload config upload
+	[ -n "$queue" ] || config_get queue "$cfg" comment
+
+	address="$ip"
+	[ -n "$address" ] || address="$ip6"
+	if ! eqosex add "${queue:-0}" "$download" "$upload" "$address" \
+		"$total_download" "$total_upload" "${connlimit:-0}"; then
+		CONFIG_ERROR=1
+	fi
+}
+
+# Decide the queue assignment before anything is programmed.
+#
+# The mapping from rules to queue requirements lives in the helper, not here.
+# The web page checks a save with the very same code path; if this script kept
+# its own copy, the page could approve a configuration that boot then rejects,
+# and the user would find out after /etc/config had already been overwritten.
+#
+# A refusal here is final and costs nothing: the planner writes no state when
+# it refuses, and nothing has been torn down yet, so the previous rules keep
+# running exactly as they were.
+plan_rules() {
+	eqosex plan --config /etc/config/eqosex
+}
+
+start_service() {
+	config_load eqosex
+
+	local enabled
+	config_get_bool enabled config enabled 0
+
+	# Short-packet priority and custom priority rules apply independently of
+	# the eqosex master switch, so they must be applied even when total
+	# bandwidth shaping is disabled (enabled=0).
+	if [ "$enabled" -eq 1 ]; then
+		local download upload
+		config_get download config download
+		config_get upload config upload
+
+		if ! is_uinteger "$download" || ! is_uinteger "$upload" ||
+		   [ "$download" -lt 1 ] || [ "$upload" -lt 1 ] ||
+		   [ "$download" -gt "$TOTAL_RATE_MAX" ] || [ "$upload" -gt "$TOTAL_RATE_MAX" ]; then
+			echo "eqosex: total download and upload rates must be between 1 and $TOTAL_RATE_MAX Mbit/s" >&2
+			return 1
+		fi
+
+		CONFIG_ERROR=0
+		USED_SELECTORS=" "
+		config_foreach validate_device device
+		[ "$CONFIG_ERROR" -eq 0 ] || return 1
+
+		# Decide every queue assignment before touching the running system.
+		#
+		# The order matters more than anything else in this script.  eqosex
+		# start tears the old rules down -- it stops the qdiscs and rebuilds
+		# the nft table -- so running it before this check would mean that a
+		# configuration too large to fit would first destroy the
+		# configuration that was working and only then refuse.  The user
+		# would be left with no shaping at all, which is strictly worse than
+		# being told to remove one row.  Planning first means a refusal costs
+		# nothing: nothing was stopped, nothing was written, the previous
+		# rules keep running.
+		#
+		# plan_rules writes nothing when it refuses, so there is no
+		# half-applied state to undo either.
+		#
+		# This lives inside the enabled block on purpose.  Device rules only
+		# exist while the master switch is on, and short-packet priority and
+		# custom priority rules apply regardless of it -- so refusing here on
+		# a switched-off service would take down features the refusal was
+		# never about.
+		if ! plan_rules; then
+			logger -t eqosex "configuration refused; the running rules are left untouched"
+			return 1
+		fi
+
+		if ! eqosex start "$download" "$upload"; then
+			eqosex stop >/dev/null 2>&1
+			return 1
+		fi
+		CONFIG_ERROR=0
+		config_foreach parse_device device
+		if [ "$CONFIG_ERROR" -ne 0 ]; then
+			eqosex stop >/dev/null 2>&1
+			return 1
+		fi
+
+		if ! eqosex enable; then
+			eqosex stop >/dev/null 2>&1
+			return 1
+		fi
+	fi
+
+	apply_short_pkt_service || {
+		eqosex stop >/dev/null 2>&1
+		return 1
+	}
+
+	apply_priority_rules_service || {
+		eqosex stop >/dev/null 2>&1
+		return 1
+	}
+
+	# Queue settings are written last, then read back.
+	#
+	# Writing them earlier -- which is what add does while the rules are
+	# being installed -- races the driver's own HQoS bring-up: the write is
+	# accepted and the queue is reset afterwards, leaving a queue with no
+	# ceiling that looks configured.  By this point every initialisation
+	# step has finished, and eqosex program re-checks what the hardware
+	# actually kept.
+	#
+	# A failure here is reported but not fatal: tearing the service down
+	# because one queue did not take would cost the operator every other
+	# rule as well, which is the exact trade this design refuses to make.
+	if ! eqosex program; then
+		logger -t eqosex "some queues did not accept their settings; they are not shaped"
+	fi
+}
+
+stop_service() {
+	eqosex stop
+}
+
+# Short-packet priority is applied independently of the eqosex master switch:
+# it is driven solely by its own config, so it keeps working even when the
+# total bandwidth shaping is disabled.  Custom priority rules cannot do that
+# -- see apply_priority_rules_service for why.
+apply_short_pkt_service() {
+	local short_pkt
+
+	config_load eqosex
+	config_get_bool short_pkt config short_pkt_priority 0
+	if [ "$short_pkt" -eq 1 ]; then
+		eqosex shortpkt
+	else
+		eqosex shortpkt-stop
+	fi
+}
+
+apply_priority_rules_service() {
+	local cfg enabled
+
+	for cfg in $(uci -q show eqosex |
+		     sed -n 's/^eqosex\.\([^=]*\)=priority_rule$/\1/p'); do
+		enabled="$(uci -q get eqosex.$cfg.enabled)"
+		if [ "$enabled" = "1" ]; then
+			# A priority rule is expressed as a queue id, and the queue id
+			# exists only because the planner handed one out; the planner in
+			# turn only runs while the shaping service is on.  With the
+			# master switch off there is no scheduler for the rule to
+			# dispatch through, so applying it would mean writing a queue
+			# register nothing reads.  Say so and carry on -- failing here
+			# would also take down short-packet priority, which has nothing
+			# to do with this.
+			if [ "$(uci -q get eqosex.config.enabled)" != "1" ]; then
+				logger -t eqosex \
+					"priority rule $cfg needs the QoS service enabled; skipped"
+				return 0
+			fi
+			eqosex priority
+			return 0
+		fi
+	done
+}
+
+reload_service() {
+	local enabled
+
+	config_load eqosex
+	config_get_bool enabled config enabled 0
+	if [ "$enabled" -eq 1 ]; then
+		start_service
+	else
+		stop_service
+		apply_short_pkt_service
+	fi
+}
+
+service_triggers() {
+	procd_add_reload_trigger eqosex
+}

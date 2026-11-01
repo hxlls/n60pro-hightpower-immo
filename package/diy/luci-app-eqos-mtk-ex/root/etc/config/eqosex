@@ -1,0 +1,69 @@
+config eqosex 'config'
+	option enabled      0
+	option download     100
+	option upload       20
+
+# Global conntrack table size.  0 keeps the kernel default (16384 with the
+# usual 8K hash buckets).  This only protects the table itself; the real
+# per-client protection is the `connlimit` of each device rule below.
+	option conntrack_max 0
+
+# Short-packet QoS (hardware small-packet priority)
+# short_pkt_priority: 0 disabled, 1 enabled
+# short_pkt_len:      max average packet size (bytes) treated as a short flow
+# short_pkt_qid:      hardware queue that short flows (ACK/small UDP) enter.
+#                     Larger queue numbers mean higher priority.  The script
+#                     overrides this with the top queue the running SoC
+#                     exposes (15 on the 16-queue MT7981/MT7986, 31 on the
+#                     32-queue MT7988) so it always stays outside the pool
+#                     that the per-device rules draw from.
+# Enabled only on request: while it is on, small flows bypass the per-client
+# upload shaping because they never reach the client's queue.
+	option short_pkt_priority 0
+	option short_pkt_len     64
+
+# Custom priority rules: map traffic to hardware queues by protocol/port/DSCP.
+# WARNING: these draw from the same hardware queue pool as the per-device
+# rules, so enabling them reduces how many clients can be shaped.  Disabled
+# by default.
+#config priority_rule
+#	option enabled   1
+#	option protocol  'udp'
+#	option dport     '27000-27030'
+#	option sport     ''
+#	option dscp      ''
+#	option direction 'up'
+#	option priority  8
+
+# Per-device bandwidth is kbit/s.  A rate of 0 leaves that direction
+# unshaped and costs no hardware queue, which is how a client can be
+# limited in one direction only.
+#
+# `queue` is just a unique rule number now -- it no longer selects a
+# hardware queue.  The pool hands out queues on demand, one per shaped
+# direction, so a client limited in both directions costs two and a client
+# limited in one direction costs one.  On the 16-queue MT7981/MT7986 the
+# pool is 14 queues: up to 7 clients shaped both ways, or more when some
+# are shaped one way only (2 * dual + single <= 14).  The 32-queue MT7988
+# doubles that.
+#
+# Rules numbered above the pool size fall back to tc software shaping,
+# which takes the client out of hardware acceleration while it is shaped.
+# Configure exactly one of ip or ip6. LuCI may also save selector.
+#
+# connlimit caps the number of simultaneous connections this client may
+# hold, counted over the connections it opens (both directions of each
+# flow).  0 means unlimited, which is the default.  Once the budget is
+# reached only new connections are refused; running ones are left alone.
+# It costs no hardware queue, so it can also be set on a rule whose rates
+# are both 0.  A sane ceiling for a single client is 300-500: the FOE
+# table holds 16384 entries per direction and one device must not be able
+# to fill it.  Needs kmod-nft-connlimit.
+#config device
+#	option enabled  1
+#	option queue    1
+#	option selector 'ip'
+#	option ip       '192.168.1.100'
+#	option download 10000
+#	option upload   5000
+#	option connlimit 400

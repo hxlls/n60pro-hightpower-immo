@@ -1,0 +1,210 @@
+msgid ""
+msgstr ""
+
+msgid "1 lowest .. 10 highest. Draws hardware queues from the same pool as the device rules, so enabling priority rules leaves fewer queues for per-client shaping. Custom rules take precedence over short-packet auto detection."
+msgstr ""
+
+msgid "A port can only be used with TCP or UDP. Select a protocol first."
+msgstr ""
+
+msgid "Active queues only"
+msgstr ""
+
+msgid "Address"
+msgstr ""
+
+msgid "Any"
+msgstr ""
+
+msgid "Automatic: the top hardware queue of this SoC (15 on the 16-queue MT7981/MT7986, 31 on the 32-queue MT7988). Kept outside the queue pool so short flows never share a queue with a shaped client."
+msgstr ""
+
+msgid "Both"
+msgstr ""
+
+msgid "Collecting data..."
+msgstr ""
+
+msgid "Connection limit"
+msgstr ""
+
+msgid "Conntrack table size"
+msgstr ""
+
+msgid "DSCP"
+msgstr ""
+
+msgid "Dest port"
+msgstr ""
+
+msgid "Device rules"
+msgstr ""
+
+msgid "Direction"
+msgstr ""
+
+msgid "Download"
+msgstr ""
+
+msgid "Download queue %s is already used by another rule."
+msgstr ""
+
+msgid "EQoS Extended"
+msgstr ""
+
+msgid "Enable"
+msgstr ""
+
+msgid "Enable Short-packet priority first."
+msgstr ""
+
+msgid "General Settings"
+msgstr ""
+
+msgid "Global number of conntrack entries the kernel may hold. 0 keeps the kernel default. This only protects the table itself; the per-device connection limits do the real work."
+msgstr ""
+
+msgid "HQoS Settings"
+msgstr ""
+
+msgid "IPv4 address"
+msgstr ""
+
+msgid "IPv6 address"
+msgstr ""
+
+msgid "Hardware queues"
+msgstr ""
+
+msgid "Len"
+msgstr ""
+
+msgid "Maximum average packet size (16-128 bytes) treated as a short flow."
+msgstr ""
+
+msgid "Maximum number of simultaneous connections this client may hold, counted over the connections it opens in both directions. 0 means unlimited. Once the budget is reached only new connections are refused, running ones are kept. Costs no hardware queue, so it also works when both rates are 0. Needs kmod-nft-connlimit; 300-500 is a sane ceiling for one client, since the FOE table holds 16384 entries per direction and one device must not be able to fill it."
+msgstr ""
+
+msgid "Maximum rate in Mbit/s. Use 0 for no limit."
+msgstr ""
+
+msgid "Mode"
+msgstr ""
+
+msgid "Network speed control service for MediaTek HNAT."
+msgstr ""
+
+msgid "No data"
+msgstr ""
+
+msgid "Only a unique label for this rule, not a hardware queue. Queues are handed out automatically from a shared pool, one per shaped direction: a client limited both ways takes two queues, a client limited one way takes one. On a 16-queue SoC the pool holds 14, so up to 7 clients shaped both ways, or more when some are limited in one direction only. A rule always takes a hardware queue while one is free; once the pool is exhausted only the affected direction falls back to TC software shaping, which keeps it limited but moves that client off hardware acceleration."
+msgstr ""
+
+msgid "Optional DSCP value 0-63, e.g. 46 for EF."
+msgstr ""
+
+msgid "Optional, e.g. 443 or 27000-27030."
+msgstr ""
+
+msgid "Optional, e.g. 53 or 27000-27030."
+msgstr ""
+
+msgid "Packet priority settings"
+msgstr ""
+
+msgid "Packets"
+msgstr ""
+
+msgid "Packets/s"
+msgstr ""
+
+msgid "Path"
+msgstr ""
+
+msgid "Priority"
+msgstr ""
+
+msgid "Priority queue"
+msgstr ""
+
+msgid "Priority rules"
+msgstr ""
+
+msgid "Protocol"
+msgstr ""
+
+msgid "QoS"
+msgstr ""
+
+msgid "Queue"
+msgstr ""
+
+msgid "Queue Monitor"
+msgstr ""
+
+msgid "Queue map"
+msgstr ""
+
+msgid "Rate"
+msgstr ""
+
+msgid "Re-marks the small packets matched by this rule (pure TCP ACKs and packets up to the short-flow bound) into the short-packet priority queue, so ACKs do not queue behind bulk traffic inside this rule's queue. Requires Short-packet priority and a port."
+msgstr ""
+
+msgid "Recognizes short flows (TCP ACK / small UDP) in hardware before offload and puts them into the priority queue below. Tune it with \"Short-flow length\" and \"Priority queue\". Works on any port, including direct 2.5G."
+msgstr ""
+
+msgid "Rule number"
+msgstr ""
+
+msgid "Short-flow length"
+msgstr ""
+
+msgid "Short-packet priority"
+msgstr ""
+
+msgid "Small packets to the short-packet priority queue"
+msgstr ""
+
+msgid "Source port"
+msgstr ""
+
+msgid "This value is already in use."
+msgstr ""
+
+msgid "Total download bandwidth."
+msgstr ""
+
+msgid "Total upload bandwidth."
+msgstr ""
+
+msgid "Type"
+msgstr ""
+
+msgid "Upload"
+msgstr ""
+
+msgid "Upload queue %s is already used by another rule."
+msgstr ""
+
+msgid "The hardware queue pool is full: any further shaped client is limited in software (TC) instead, which keeps it shaped but takes it off hardware acceleration."
+msgstr ""
+
+msgid "unlimited"
+msgstr ""
+
+msgid "unspecified"
+msgstr ""
+
+msgid "Queue group"
+msgstr ""
+
+msgid "Optional. Clients naming the same group share one hardware queue, so the rates below become that group's total budget instead of a per-client limit. Leave empty to give this client its own queue, exactly as before. Every member of a group must use the same rate in each shaped direction. A group costs two queues when shaped both ways and one when shaped in a single direction, so a 16-queue SoC holds up to 7 bidirectional groups or 15 single-direction groups -- each with any number of clients inside it. Members of one group share a single FIFO shaper: one of them can consume the whole group budget while the others wait, which is the price of putting more clients on the hardware path than there are queues."
+msgstr ""
+
+msgid "standalone"
+msgstr ""
+
+msgid "Use up to 32 letters, digits, dots, dashes or underscores."
+msgstr ""
+
