@@ -1,0 +1,113 @@
+hnat: dispatch short packets to a high-priority queue
+
+When short_pkt_toggle is enabled, TCP ACKs (payload 0) and small UDP
+packets (payload <= short_pkt_len) are dispatched to the high-priority
+hardware queue short_pkt_qid on any path, so games and other
+latency-sensitive small flows are prioritised even on 2.5G direct ports
+where the per-port-per-queue mapping does not apply.
+
+Flows that already carry an explicit queue id via skb->mark (custom
+priority rules, device rules) keep that queue: auto detection only
+applies to otherwise unclassified traffic, i.e. to flows whose mark is
+below MAX_PPPQ_QUEUE_NUM, which is exactly how the PPPQ/HQoS code above
+classifies them. Only genuine short packets are redirected, so the bulk
+packets of a classified flow keep the queue their rule selected.
+
+The check is deliberately not gated on !IS_HQOS_MODE. HQoS is what turns
+the skb->mark to QDMA queue mapping on in the first place, and
+luci-app-eqos-mtk sets qos_toggle to 1 right before enabling
+short_pkt_toggle, so excluding HQoS made the feature a no-op for every
+user configuring it from the UI.
+
+HNAT_QDMA_QUEUE_MASK is used rather than MTK_QDMA_QUEUE_MASK. The latter
+is not a queue-bit mask: its width follows the kernel series, and the
+per-SoC variant it expands to today cannot even be evaluated in this
+scope, where eth is a struct ethhdr.
+
+Signed-off-by: ling <ling@192.168.1.16>
+---
+
+diff --git a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+index 2481bfb..daf2495 100644
+--- a/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
++++ b/drivers/net/ethernet/mediatek/mtk_hnat/hnat_nf_hook.c
+@@ -3106,8 +3106,77 @@ hnat_entry_bind:
+ 	else
+ 		qid = 0;
+ 
+-	if (IS_PPPQ_MODE && IS_PPPQ_PATH(dev, skb) &&
+-	    port_id >= 0 && qid < MAX_PPPQ_QUEUE_NUM) {
++	/* Short-packet QoS: TCP ACKs and small UDP packets are dispatched to a
++	 * high-priority queue on any path (no PPPQ requirement), so games and
++	 * other latency-sensitive small flows get prioritized even on 2.5G
++	 * direct ports.
++	 *
++	 * Flows that already carry an explicit queue id via skb->mark (custom
++	 * priority rules / device rules) keep that queue; auto detection only
++	 * applies to otherwise unclassified traffic, i.e. to flows whose mark is
++	 * below MAX_PPPQ_QUEUE_NUM, exactly how the PPPQ/HQoS code above
++	 * classifies them. Only genuine short packets are redirected below, so
++	 * the bulk packets of a classified flow keep the queue their rule
++	 * selected.
++	 *
++	 * Deliberately not gated on !IS_HQOS_MODE: HQoS is what turns the
++	 * skb->mark -> QDMA queue mapping on in the first place, and
++	 * luci-app-eqos-mtk sets qos_toggle to 1 before enabling
++	 * short_pkt_toggle, so excluding HQoS would make the feature a no-op for
++	 * every user configuring it from the UI.
++	 *
++	 * HNAT_QDMA_QUEUE_MASK only covers the queue bits the hardware can
++	 * address (num_tx_queues - 1), so bit 7 (HNAT_EXCEPTION_BIT) can never
++	 * leak into a queue id. MTK_QDMA_QUEUE_MASK must not be used here: its
++	 * width follows the kernel series and the per-SoC variant needs a
++	 * struct mtk_eth in scope, while eth is a struct ethhdr here.
++	 */
++	if (short_pkt_toggle &&
++	    (skb->mark & HNAT_QDMA_QUEUE_MASK) < MAX_PPPQ_QUEUE_NUM) {
++		/* -1 means "the last queue this SoC has" (15 / 63). */
++		u32 sp_qid = (short_pkt_qid >= 0 &&
++			      short_pkt_qid < HNAT_QDMA_NUM_QUEUES) ?
++			     short_pkt_qid : HNAT_QDMA_NUM_QUEUES - 1;
++
++		if (h_proto == ETH_P_IP) {
++			iph = (struct iphdr *)(skb_network_header(skb) + h_offset);
++			if (iph->protocol == IPPROTO_TCP) {
++				tcph = (struct tcphdr *)((u8 *)iph + iph->ihl * 4);
++				payload_len = be16_to_cpu(iph->tot_len) -
++					      iph->ihl * 4 - __tcp_hdrlen(tcph);
++				if (payload_len == 0) {
++					qid = sp_qid;
++					pr_info_once("hnat shortpkt: TCP ACK -> qid %d\n", qid);
++				}
++			} else if (iph->protocol == IPPROTO_UDP) {
++				payload_len = be16_to_cpu(iph->tot_len) -
++					      iph->ihl * 4 - sizeof(struct udphdr);
++				if (payload_len <= short_pkt_len) {
++					qid = sp_qid;
++					pr_info_once("hnat shortpkt: UDP len=%u -> qid %d\n",
++						     payload_len, qid);
++				}
++			}
++		} else if (h_proto == ETH_P_IPV6) {
++			ip6h = (struct ipv6hdr *)(skb_network_header(skb) + h_offset);
++			if (ip6h->nexthdr == NEXTHDR_TCP) {
++				tcph = (struct tcphdr *)((u8 *)ip6h + sizeof(struct ipv6hdr));
++				payload_len = be16_to_cpu(ip6h->payload_len) - __tcp_hdrlen(tcph);
++				if (payload_len == 0) {
++					qid = sp_qid;
++					pr_info_once("hnat shortpkt: IPv6 TCP ACK -> qid %d\n", qid);
++				}
++			} else if (ip6h->nexthdr == NEXTHDR_UDP) {
++				payload_len = be16_to_cpu(ip6h->payload_len) - sizeof(struct udphdr);
++				if (payload_len <= short_pkt_len) {
++					qid = sp_qid;
++					pr_info_once("hnat shortpkt: IPv6 UDP len=%u -> qid %d\n",
++						     payload_len, qid);
++				}
++			}
++		}
++	} else if (IS_PPPQ_MODE && IS_PPPQ_PATH(dev, skb) &&
++		   port_id >= 0 && qid < MAX_PPPQ_QUEUE_NUM) {
+ 		if (h_proto == ETH_P_IP) {
+ 			iph = (struct iphdr *)(skb_network_header(skb) + h_offset);
+ 			if (iph->protocol == IPPROTO_TCP) {
