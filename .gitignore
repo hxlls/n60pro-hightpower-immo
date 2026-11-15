@@ -35,3 +35,8 @@ git-src
 .cproject
 .ccache
 .vscode*
+
+# build scratch, local backups and vendored package histories
+.attic/
+build.log
+package/diy/*/.git/

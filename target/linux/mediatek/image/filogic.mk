@@ -4098,6 +4098,22 @@ define Device/zyxel_ex5700-telenor
 endef
 TARGET_DEVICES += zyxel_ex5700-telenor
 
+define Device/zyxel_ex5700-telenor-mtk
+  DEVICE_VENDOR := Zyxel
+  DEVICE_MODEL := EX5700 (Telenor) MTK
+  DEVICE_DTS := mt7986a-zyxel-ex5700-telenor-mtk
+  DEVICE_DTS_DIR := ../dts
+  DEVICE_PACKAGES := kmod-ubootenv-nvram kmod-usb3 automount
+  BOARD_NAME := zyxel_ex5700-telenor
+  SUPPORTED_DEVICES := zyxel,ex5700-telenor
+  UBINIZE_OPTS := -E 5
+  BLOCKSIZE := 128k
+  PAGESIZE := 2048
+  IMAGE_SIZE := 65536k
+  IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+endef
+TARGET_DEVICES += zyxel_ex5700-telenor-mtk
+
 define Device/zyxel_nwa50ax-pro
   DEVICE_VENDOR := Zyxel
   DEVICE_MODEL := NWA50AX Pro
