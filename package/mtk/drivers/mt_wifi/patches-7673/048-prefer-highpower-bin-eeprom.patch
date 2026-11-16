@@ -1,0 +1,62 @@
+--- a/mt_wifi/embedded/common/ee_flash.c
++++ b/mt_wifi/embedded/common/ee_flash.c
+@@ -322,11 +322,59 @@
+ }
+ 
+ 
++static BOOLEAN prefer_bin_eeprom_id(RTMP_ADAPTER *pAd, PUCHAR start)
++{
++	struct _RTMP_CHIP_OP *ops = hc_get_chip_ops(pAd->hdev_ctrl);
++	CHAR path[100] = {'\0'};
++	RTMP_OS_FS_INFO osFsInfo;
++	RTMP_OS_FD srcf;
++	UCHAR probe;
++	INT ret_val;
++
++	if (!ops || ops->get_bin_image_file == NULL)
++		return FALSE;
++
++	ops->get_bin_image_file(pAd, path, FALSE);
++
++	if (!strlen(path))
++		return FALSE;
++
++	RtmpOSFSInfoChange(&osFsInfo, TRUE);
++	srcf = RtmpOSFileOpen(path, O_RDONLY, 0);
++
++	if (IS_FILE_OPEN_ERR(srcf)) {
++		RtmpOSFSInfoChange(&osFsInfo, FALSE);
++		return FALSE;
++	}
++
++	/* Every table shipped in rebb/ is exactly 4096 bytes.  Probe past that
++	 * offset: if a byte can be read there the file is the 2 MB high-power
++	 * image, otherwise it is a stock table and the on-board EEPROM is kept.
++	 */
++	RtmpOSFileSeek(srcf, 4096);
++	ret_val = RtmpOSFileRead(srcf, (char *)&probe, 1);
++	RtmpOSFileClose(srcf);
++	RtmpOSFSInfoChange(&osFsInfo, FALSE);
++
++	if (ret_val != 1)
++		return FALSE;
++
++	MTWF_PRINT("High-power EEPROM BIN %s overrides on-board EEPROM\n", path);
++
++	if (rtmp_ee_flash_reset(pAd, start) != NDIS_STATUS_SUCCESS)
++		return FALSE;
++
++	return TRUE;
++}
++
+ static NDIS_STATUS rtmp_ee_flash_init(PRTMP_ADAPTER pAd, PUCHAR start)
+ {
+ 	struct _RTMP_CHIP_CAP *cap = hc_get_chip_cap(pAd->hdev_ctrl);
+ 	cap->ee_inited = 1;
+ 
++	if (prefer_bin_eeprom_id(pAd, start) == TRUE)
++		return NDIS_STATUS_SUCCESS;
++
+ 	if (validFlashEepromID(pAd) == FALSE) {
+ 		if (rtmp_ee_flash_reset(pAd, start) != NDIS_STATUS_SUCCESS) {
+ 			MTWF_DBG(pAd, DBG_CAT_HW, DBG_SUBCAT_ALL, DBG_LVL_ERROR, "rtmp_ee_init(): rtmp_ee_flash_init() failed\n");

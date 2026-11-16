@@ -1,0 +1,22 @@
+--- a/mt_wifi/mac/mt_fmac.c	2026-10-23 19:57:40.344980287 +0000
++++ b/mt_wifi/mac/mt_fmac.c	2026-10-23 19:57:40.348689790 +0000
+@@ -5312,6 +5312,19 @@
+ 
+ 		MTWF_PRINT("[%s] band_idx:%d pwr:%d ChBand:%s ePAGain:%d\n",  __func__, prEventTxPowerAllRateInfo->u1BandIdx,
+ 			pAd->ApCfg.MgmtTxPwr[prEventTxPowerAllRateInfo->u1BandIdx], (prEventTxPowerAllRateInfo->u1ChBand) ? ("5G") : ("2G"), prEventTxPowerAllRateInfo->u1EpaFeGain);
++#ifdef MGMT_TXPWR_CTRL
++		{
++			UINT8 *pu1Raw = (UINT8 *)prEventTxPowerAllRateInfo;
++			INT32 i4I;
++
++			MTWF_PRINT("[%s] RAW:", __func__);
++			for (i4I = 0; i4I < 32; i4I++)
++				MTWF_PRINT(" %02x", *(pu1Raw + i4I));
++			MTWF_PRINT(" (len=%u MaxBnd=%d MinBnd=%d)\n", Length,
++				(INT32)prEventTxPowerAllRateInfo->i1PwrMaxBnd,
++				(INT32)prEventTxPowerAllRateInfo->i1PwrMinBnd);
++		}
++#endif
+ #endif
+ #ifdef TPC_SUPPORT
+ #ifdef TPC_MODE_CTRL

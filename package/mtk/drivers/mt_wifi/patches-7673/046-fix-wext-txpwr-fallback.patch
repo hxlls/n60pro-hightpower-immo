@@ -1,0 +1,74 @@
+--- a/mt_wifi/embedded/ap/ap_cfg.c	2026-10-23 19:57:40.291372033 +0000
++++ b/mt_wifi/embedded/ap/ap_cfg.c	2026-10-23 19:57:40.300371491 +0000
+@@ -29972,6 +29972,7 @@
+ 	POS_COOKIE pObj = NULL;
+ 	UCHAR apidx = 0;
+ 	struct wifi_dev *wdev = NULL;
++	static ULONG u4LastTxPwrDbg = 0;
+ 
+ 	if (ad == NULL) {
+ 		MTWF_DBG(NULL, DBG_CAT_CFG, DBG_SUBCAT_ALL, DBG_LVL_ERROR, "ad null!\n");
+@@ -29985,6 +29986,8 @@
+ 
+ 	if ((pObj->ioctl_if_type == INT_MBSSID) || (pObj->ioctl_if_type == INT_MAIN))
+ 	{
++		UINT32 u4Retry = 0;
++
+ 		apidx = pObj->ioctl_if;
+ 		if (apidx >= ad->ApCfg.BssidNum)
+ 			return -EFAULT;
+@@ -29996,8 +29999,54 @@
+ 		else
+ 			BandIdx = BAND0;
+ 
++		/* the per-rate power event may still be pending, ask firmware once more */
++		if (ad->ApCfg.MgmtTxPwr[BandIdx] == 0) {
++			MtCmdTxPwrShowInfo(ad, TXPOWER_ALL_RATE_POWER_INFO, BandIdx);
++			while ((ad->ApCfg.MgmtTxPwr[BandIdx] == 0) && (u4Retry < 20)) {
++				OS_WAIT(1);
++				u4Retry++;
++			}
++		}
++
++		/* 0.5 dBm units -> dBm */
+ 		Tx_Pwr = (ad->ApCfg.MgmtTxPwr[BandIdx] + ad->ApCfg.EpaFeGain[BandIdx] + (wdev->TxPwrDelta)) / 2;
+ 
++		if (Tx_Pwr <= 0) {
++		/* firmware reported nothing: read CCK/OFDM power from the MAC registers */
++		{
++			UINT32 u4Omac = 0, u4Cmac = 0;
++			INT32 i4OfdmPwr = 0, i4CckPwr = 0;
++
++			if (BandIdx == BAND0) {
++				MAC_IO_READ32(ad->hdev_ctrl, 0x21024, &u4Omac);
++				MAC_IO_READ32(ad->hdev_ctrl, 0x21020, &u4Cmac);
++			} else {
++				MAC_IO_READ32(ad->hdev_ctrl, 0xa1024, &u4Omac);
++				MAC_IO_READ32(ad->hdev_ctrl, 0xa1020, &u4Cmac);
++			}
++
++			if ((u4Cmac & 0xff) <= 0x3f)
++				i4CckPwr = ((INT32)(u4Cmac & 0xff) >> 1);
++			else
++				i4CckPwr = (((INT32)((u4Cmac & 0xff) - 0x80) >> 1) | 0x80000000);
++
++			if ((u4Omac & 0xff) <= 0x3f)
++				i4OfdmPwr = ((INT32)(u4Omac & 0xff) >> 1);
++			else
++				i4OfdmPwr = (((INT32)((u4Omac & 0xff) - 0x80) >> 1) | 0x80000000);
++
++			Tx_Pwr = (i4OfdmPwr > i4CckPwr) ? i4OfdmPwr : i4CckPwr;
++
++			if (RTMP_TIME_AFTER(jiffies, u4LastTxPwrDbg + 5 * HZ)) {
++				u4LastTxPwrDbg = jiffies;
++				MTWF_PRINT("[txpwr] apidx=%d band=%d MgmtTxPwr=%d EPA=%d Delta=%d omac=0x%08x cmac=0x%08x -> %d dBm\n",
++					apidx, BandIdx, ad->ApCfg.MgmtTxPwr[BandIdx],
++					ad->ApCfg.EpaFeGain[BandIdx], wdev->TxPwrDelta,
++					(unsigned int)u4Omac, (unsigned int)u4Cmac, Tx_Pwr);
++			}
++		}
++		}
++
+ 		return Tx_Pwr;
+ 	}
+ 
