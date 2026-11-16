@@ -1074,6 +1074,22 @@ endef
 
 $(eval $(call KernelPackage,tcp-bbr))
 
+define KernelPackage/tcp-bbr1
+  SUBMENU:=$(NETWORK_SUPPORT_MENU)
+  TITLE:=BBR1 TCP congestion control
+  KCONFIG:=CONFIG_TCP_CONG_BBR1
+  FILES:=$(LINUX_DIR)/net/ipv4/tcp_bbr1.ko
+  AUTOLOAD:=$(call AutoProbe,tcp_bbr1)
+endef
+
+define KernelPackage/tcp-bbr1/description
+ Kernel module for BBRv1 (Bottleneck Bandwidth and RTT) TCP congestion
+ control. The legacy BBRv1 implementation, kept alongside the updated
+ BBR (v3) module for comparison and fallback.
+endef
+
+$(eval $(call KernelPackage,tcp-bbr1))
+
 define KernelPackage/tls
   SUBMENU:=$(NETWORK_SUPPORT_MENU)
   TITLE:=In-kernel TLS Support with HW Offload
