@@ -36,7 +36,7 @@ git-src
 .ccache
 .vscode*
 
-# build scratch, local backups and vendored package histories
+# build scratch, local backups and out-of-tree packages
 .attic/
 build.log
-package/diy/*/.git/
+package/diy/
