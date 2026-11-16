@@ -42,8 +42,6 @@ fast_classifier)
 	;;
 esac
 
-set_default tcpcca cubic
-
 uci -q commit "turboacc"
 
 uci -q batch <<-EOF >"/dev/null"

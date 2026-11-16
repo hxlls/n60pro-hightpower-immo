@@ -65,7 +65,8 @@ start_service() {
 		;;
 	esac
 
+	# uci 未指定时不覆盖全局拥塞控制，保留 /etc/sysctl.d 里的设置
 	local tcpcca
-	config_get "tcpcca" "config" "tcpcca" "cubic"
-	sysctl -w net.ipv4.tcp_congestion_control="$tcpcca" >"/dev/null"
+	config_get "tcpcca" "config" "tcpcca"
+	[ -n "$tcpcca" ] && sysctl -w net.ipv4.tcp_congestion_control="$tcpcca" >"/dev/null" 2>&1
 }
